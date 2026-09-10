@@ -2,45 +2,56 @@
 #
 # SPDX-License-Identifier: LGPL-3.0-only
 
-"""Stateless workload deployment and lifecycle primitives for SecEng charms.
+"""Versioned deployment of a Python workload from an offline wheelhouse.
 
-This module provides pure Python, ops-free primitives and workflows for
-unpacking archives safely, building isolated virtual environments, and
-atomically activating workloads via symlink flips. Release artifacts are
-acquired by charmlibs.seceng.github, and the units that run a deployed workload
-are managed by charmlibs.seceng.systemd.
+A deployment is a tree the caller owns: ``<install_root>/venvs`` holds one
+virtualenv per release tag and ``<install_root>/current`` is a symlink to the
+one in service. Neither directory is ever created here, because their ownership
+and permissions belong to the charm that laid the tree out. Release artifacts
+are acquired by charmlibs.seceng.github and the unit that runs a deployed
+workload is managed by charmlibs.seceng.systemd.
+
+Every virtualenv is built at the path it will be served from and is linked into
+service only once it has been proven to import the workload, so a failed build
+is deleted and the deployment in service is never written into. Each
+check-then-act sequence -- replacing the symlink, pruning old versions -- holds
+an O_DIRECTORY descriptor on the parent directory and acts through *at()
+syscalls, so the directory cannot be swapped for another between the check and
+the act.
 """
 
 from __future__ import annotations
 
 __all__ = [
     'ArtifactExtractionError',
+    'Version',
+    'Wheelhouse',
     'WorkloadError',
     'WorkloadInstallError',
-    'flip_symlink',
-    'get_active_version',
-    'install_and_activate_wheelhouse',
-    'is_version_installed',
-    'prune_versions',
     'unpack_archive',
-    'validate_version',
 ]
 
+import collections.abc
 import contextlib
-import logging
 import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
+import tempfile
 
 from . import utils
 
 _VERSION_PATTERN = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]*\Z')
-_SELF_CHECK_REASON_LIMIT = 200
-# Bound for every local subprocess (venv creation, pip, import self-check);
-# without it a hung child blocks the hook until Juju kills it.
+_VENVS_DIR_NAME = 'venvs'
+_CURRENT_LINK_NAME = 'current'
+_REQUIREMENT_STAMP_NAME = '.wheelhouse-requirement'
+_SYSTEM_PYTHON = '/usr/bin/python3'
+# Bound for every local subprocess (virtualenv creation, pip, the import
+# self-check); without it a hung child blocks the hook until Juju kills the
+# whole dispatch.
 _SUBPROCESS_TIMEOUT_SECONDS = 300
 
 
@@ -49,52 +60,32 @@ class WorkloadError(Exception):
 
 
 class ArtifactExtractionError(WorkloadError):
-    """Archive extraction failed or contained unsafe paths."""
+    """Archive extraction failed or the archive contained unsafe paths."""
 
 
 class WorkloadInstallError(WorkloadError):
-    """Virtual environment creation, pip install, or self-check failed."""
+    """Virtual environment creation, pip install, or the self-check failed."""
 
 
-def validate_version(version: str) -> str:
-    """Validate release tag string format.
+class Version(str):
+    """A release tag that is safe to use as a single path component.
 
-    Rejects empty strings, path traversal, leading hyphens, and URL metacharacters.
-    Raises WorkloadError on invalid version.
+    Admits an alphanumeric first character followed by alphanumerics, dots,
+    underscores, and hyphens. That is what allows a version to be interpolated
+    into a path or a symlink target with no further checking: it can be neither
+    empty, nor '.' or '..', nor carry a separator.
     """
-    if not version:
-        raise WorkloadError('version must not be empty.')
-    if not _VERSION_PATTERN.match(version):
-        raise WorkloadError(
-            f'version {version!r} is not a valid release tag: use only letters, digits, dot, underscore, '
-            'and hyphen, starting with a letter or digit.'
-        )
-    return version
 
+    __slots__ = ()
 
-def _swap_directory(staging_dir: pathlib.Path, dest_dir: pathlib.Path) -> None:
-    """Atomically replace dest_dir with staging_dir.
-
-    The previous dest_dir (if any) is renamed aside, the staging directory is
-    renamed into place, and the previous copy is deleted. If the final rename
-    fails, the previous copy is restored; if restoration also fails, the backup
-    is left next to dest_dir (hidden, dot-prefixed) for prune_versions() or a
-    later invocation to clean up.
-    """
-    backup = dest_dir.with_name(f'.{dest_dir.name}.old')
-    shutil.rmtree(backup, ignore_errors=True)
-    if dest_dir.is_symlink() or dest_dir.exists():
-        os.replace(dest_dir, backup)
-    try:
-        os.replace(staging_dir, dest_dir)
-    except OSError:
-        if backup.is_symlink() or backup.exists():
-            try:
-                os.replace(backup, dest_dir)
-            except OSError:
-                logging.exception(f'Failed to restore previous directory at {dest_dir}; kept {backup}')
-        raise
-    shutil.rmtree(backup, ignore_errors=True)
+    def __new__(cls, value: str) -> Version:
+        """Validate value and return it as a Version, or raise ValueError."""
+        if not _VERSION_PATTERN.match(value):
+            raise ValueError(
+                f'version {value!r} must start with a letter or digit and contain only letters, digits, and '
+                "the characters '._-'"
+            )
+        return super().__new__(cls, value)
 
 
 def unpack_archive(archive_path: pathlib.Path, dest_dir: pathlib.Path) -> None:
@@ -136,282 +127,270 @@ def unpack_archive(archive_path: pathlib.Path, dest_dir: pathlib.Path) -> None:
         on_failure.pop_all()
 
 
-def flip_symlink(current_link: pathlib.Path, target_dir: pathlib.Path) -> None:
-    """Atomically update current_link to point to target_dir via os.replace.
+def _run(argv: collections.abc.Sequence[str], step: str) -> None:
+    """Run argv to completion, or raise WorkloadInstallError naming step.
 
-    A temporary symlink is created in current_link's parent directory and
-    atomically renamed over current_link.
+    The environment is the ambient one minus the charm's own interpreter
+    context, so a build cannot pick up the charm's virtualenv, and the call is
+    bounded so a hung child cannot hold the hook.
     """
-    if current_link.exists(follow_symlinks=False) and not current_link.is_symlink():
-        raise WorkloadError(f'{current_link} exists and is not a symlink; refusing to replace.')
-
-    current_link.parent.mkdir(parents=True, exist_ok=True)
-    temp_link = current_link.with_name(f'.{current_link.name}.tmp')
-    if temp_link.is_symlink() or temp_link.exists():
-        temp_link.unlink()
-
-    target_to_store: pathlib.Path
-    if target_dir.is_absolute():
-        try:
-            target_to_store = target_dir.relative_to(current_link.parent)
-        except ValueError:
-            target_to_store = target_dir
-    else:
-        target_to_store = target_dir
-
-    os.symlink(target_to_store, temp_link)
     try:
-        os.replace(temp_link, current_link)
-    except OSError as err:
-        if temp_link.is_symlink() or temp_link.exists():
-            temp_link.unlink(missing_ok=True)
-        raise WorkloadError(f'Failed to atomically swap symlink {current_link}: {err}') from err
-
-
-def prune_versions(versions_dir: pathlib.Path, active_version: str | None, keep: int = 2) -> list[str]:
-    """Remove oldest version directories by modification time, retaining keep versions.
-
-    The active_version is always preserved if present. Hidden dot-prefixed
-    directories are transient build artifacts (version tags can never start
-    with a dot) and are always removed.
-    Returns the sorted list of removed version directory names.
-    """
-    if keep < 1:
-        raise ValueError('keep must be at least 1.')
-    if not versions_dir.exists():
-        return []
-
-    entries: list[pathlib.Path] = []
-    for entry in versions_dir.iterdir():
-        if entry.is_symlink() or not entry.is_dir():
-            continue
-        if entry.name.startswith('.'):
-            shutil.rmtree(entry, ignore_errors=True)
-            continue
-        entries.append(entry)
-    retained: list[str] = [active_version] if active_version else []
-    for entry in sorted(entries, key=lambda e: e.stat().st_mtime, reverse=True):
-        if len(retained) >= keep:
-            break
-        if entry.name not in retained:
-            retained.append(entry.name)
-
-    removed: list[str] = []
-    for entry in entries:
-        if entry.name not in retained:
-            shutil.rmtree(entry, ignore_errors=True)
-            removed.append(entry.name)
-    return sorted(removed)
-
-
-def get_active_version(install_root: pathlib.Path) -> str | None:
-    """Return the version currently targeted by install_root / 'current', if any."""
-    current_link = install_root / 'current'
-    try:
-        target = os.readlink(current_link)
-    except OSError:
-        return None
-    return pathlib.PurePosixPath(target).name
-
-
-def is_version_installed(
-    install_root: pathlib.Path,
-    version: str,
-    requirement: str,
-    import_name: str,
-) -> bool:
-    """Return whether a version venv exists, matches requirement, and imports cleanly."""
-    venv_dir = install_root / 'venvs' / version
-    python_bin = venv_dir / 'bin' / 'python3'
-    if not python_bin.is_file():
-        python_bin = venv_dir / 'bin' / 'python'
-        if not python_bin.is_file():
-            return False
-
-    requirement_stamp = venv_dir / '.wheelhouse-requirement'
-    try:
-        content = requirement_stamp.read_text(encoding='utf-8').strip()
-    except OSError:
-        return False
-    if content != requirement.strip():
-        return False
-
-    if not all(part.isidentifier() for part in import_name.split('.')):
-        return False
-
-    try:
-        result = utils.run(
-            [str(python_bin), '-c', f'import {import_name}'],
+        result = subprocess.run(
+            argv,
             check=False,
-            capture=True,
+            capture_output=True,
+            env=utils.clean_env(),
             timeout=_SUBPROCESS_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
-def _rewrite_venv_paths(staging_dir: pathlib.Path, venv_dir: pathlib.Path) -> None:
-    """Rewrite absolute staging paths in venv scripts to their final location.
-
-    Virtualenv creation and pip bake the absolute staging path into script
-    shebangs and activation scripts; after the staging directory is renamed
-    into place those references would dangle.
-    """
-    old_path = str(staging_dir).encode('utf-8')
-    new_path = str(venv_dir).encode('utf-8')
-    for entry in (staging_dir / 'bin').iterdir():
-        if entry.is_symlink() or not entry.is_file():
-            continue
-        data = entry.read_bytes()
-        if old_path in data:
-            entry.write_bytes(data.replace(old_path, new_path))
-
-
-def install_and_activate_wheelhouse(
-    wheelhouse_dir: pathlib.Path,
-    install_root: pathlib.Path,
-    version: str,
-    requirement: str,
-    import_name: str,
-) -> None:
-    """Build, verify, and activate a Python wheelhouse workload atomically.
-
-    Executes the following sequence:
-    1. Validates version tag.
-    2. Creates a staging virtualenv at install_root / 'venvs' / ('.' + version + '.staging').
-    3. Runs pip install --isolated --no-index --find-links wheelhouse_dir --force-reinstall requirement.
-    4. Rewrites staging paths baked into venv scripts to their final location.
-    5. Runs module self-check: <venv_python> -c "import <import_name>".
-    6. Writes requirement stamp: <staging> / '.wheelhouse-requirement'.
-    7. Atomically swaps the staging venv into install_root / 'venvs' / version.
-    8. Atomically flips install_root / 'current' -> venvs / version.
-    9. Prunes old versions in install_root / 'venvs' (retains active + 1 previous).
-
-    Transactional Safety: the candidate venv is built under a hidden staging
-    path and only swapped into place once every check passes, so a failure at
-    any step -- including a reinstall of the currently active version -- leaves
-    the active deployment and the current symlink fully intact. Failed staging
-    builds are deleted immediately. All subprocesses are bounded by a
-    300 second timeout.
-    Raises WorkloadInstallError on failure.
-    """
-    try:
-        version = validate_version(version)
-    except WorkloadError as err:
-        raise WorkloadInstallError(str(err)) from err
-
-    if not all(part.isidentifier() for part in import_name.split('.')):
-        raise WorkloadInstallError(f'Invalid import name: {import_name!r}')
-
-    venvs_dir = install_root / 'venvs'
-    venv_dir = venvs_dir / version
-    staging_dir = venvs_dir / f'.{version}.staging'
-    try:
-        venvs_dir.mkdir(parents=True, exist_ok=True)
+    except subprocess.TimeoutExpired as err:
+        raise WorkloadInstallError(f'{step} did not finish within {_SUBPROCESS_TIMEOUT_SECONDS} seconds') from err
     except OSError as err:
-        raise WorkloadInstallError(f'Failed to create venvs directory: {err}') from err
+        raise WorkloadInstallError(f'failed to start {step}: {err}') from err
+    if result.returncode != 0:
+        raise WorkloadInstallError(
+            f'{step} failed with exit status {result.returncode}{utils.stderr_detail(result.stderr)}'
+        )
 
-    # A previous crashed attempt may have left a staging directory behind.
-    shutil.rmtree(staging_dir, ignore_errors=True)
 
+@contextlib.contextmanager
+def _directory_fd(path: pathlib.Path) -> collections.abc.Iterator[int]:
+    """Hold path open as the descriptor that *at() syscalls resolve against.
+
+    Raises OSError if path is not an existing directory.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        try:
-            utils.run(
-                ['/usr/bin/python3', '-m', 'venv', str(staging_dir)],
-                check=True,
-                capture=True,
-                timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as err:
-            raise WorkloadInstallError(f'Failed to create virtualenv for {version}: {err}') from err
+        yield fd
+    finally:
+        os.close(fd)
 
-        python_bin = staging_dir / 'bin' / 'python3'
-        if not python_bin.exists():
-            python_bin = staging_dir / 'bin' / 'python'
 
-        pip_bin = staging_dir / 'bin' / 'pip'
+def _replace_symlink(parent_fd: int, link_name: str, target: str) -> None:
+    """Point link_name at target inside the directory held open as parent_fd.
 
-        try:
-            utils.run(
-                [
-                    str(pip_bin),
-                    'install',
-                    '--isolated',
-                    '--no-index',
-                    '--find-links',
-                    str(wheelhouse_dir),
-                    '--force-reinstall',
-                    requirement,
-                ],
-                check=True,
-                capture=True,
-                timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as err:
-            raise WorkloadInstallError(f'pip install timed out for {requirement} in {version}') from err
-        except subprocess.CalledProcessError as err:
-            detail = ''
-            if err.stderr:
-                lines = [
-                    line.strip() for line in err.stderr.decode('utf-8', errors='replace').splitlines() if line.strip()
-                ]
-                if lines:
-                    detail = f': {lines[-1][:_SELF_CHECK_REASON_LIMIT]}'
-            raise WorkloadInstallError(f'pip install failed for {requirement} in {version}{detail}') from err
-
-        try:
-            _rewrite_venv_paths(staging_dir, venv_dir)
-        except OSError as err:
-            raise WorkloadInstallError(f'Failed to rewrite staging paths for {version}: {err}') from err
-
-        try:
-            result = utils.run(
-                [str(python_bin), '-c', f'import {import_name}'],
-                check=False,
-                capture=True,
-                timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as err:
-            raise WorkloadInstallError(
-                f'Workload {version} failed self-check: import of {import_name} timed out'
-            ) from err
-        if result.returncode != 0:
-            detail = ''
-            if result.stderr:
-                lines = [
-                    line.strip()
-                    for line in result.stderr.decode('utf-8', errors='replace').splitlines()
-                    if line.strip()
-                ]
-                if lines:
-                    detail = f' ({lines[-1][:_SELF_CHECK_REASON_LIMIT]})'
-            raise WorkloadInstallError(
-                f'Workload {version} failed self-check: {import_name} could not be imported{detail}'
-            )
-
-        requirement_stamp = staging_dir / '.wheelhouse-requirement'
-        try:
-            with utils.open_file_secure(requirement_stamp, mode=0o644, create_parents=True) as f:
-                f.write(f'{requirement}\n')
-        except OSError as err:
-            raise WorkloadInstallError(f'Failed to write requirement stamp: {err}') from err
-
-        try:
-            _swap_directory(staging_dir, venv_dir)
-        except OSError as err:
-            raise WorkloadInstallError(f'Failed to activate virtualenv for {version}: {err}') from err
-    except Exception:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+    The link is staged under a temporary name and renamed over link_name, so a
+    reader following it sees either the old target or the new one; both syscalls
+    resolve against parent_fd. Replaces anything but a directory, which rename
+    refuses. Raises OSError.
+    """
+    staged = f'.{link_name}.tmp'
+    try:
+        os.symlink(target, staged, dir_fd=parent_fd)
+    except FileExistsError:
+        # Left behind by a run interrupted between the symlink and the rename.
+        os.unlink(staged, dir_fd=parent_fd)
+        os.symlink(target, staged, dir_fd=parent_fd)
+    try:
+        os.rename(staged, link_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(staged, dir_fd=parent_fd)
         raise
 
-    current_link = install_root / 'current'
-    try:
-        flip_symlink(current_link, venv_dir)
-    except WorkloadError as err:
-        raise WorkloadInstallError(str(err)) from err
 
-    try:
-        prune_versions(venvs_dir, active_version=version, keep=2)
-    except (OSError, WorkloadError) as err:
-        raise WorkloadInstallError(f'Failed to prune old versions: {err}') from err
+class Wheelhouse:
+    """The versioned virtualenv deployment rooted at one install directory."""
+
+    def __init__(self, install_root: pathlib.Path, import_name: str):
+        """Bind to the deployment at install_root that serves import_name.
+
+        install_root and its 'venvs' subdirectory must already exist, with the
+        ownership and permissions the caller intends. Raises ValueError if
+        import_name is not a Python module path.
+        """
+        if not all(part.isidentifier() for part in import_name.split('.')):
+            raise ValueError(f'import name {import_name!r} is not a python module path')
+        self.install_root = install_root
+        self.import_name = import_name
+        self.venvs_dir = install_root / _VENVS_DIR_NAME
+        self.current_link = install_root / _CURRENT_LINK_NAME
+
+    def get_active_version(self) -> str | None:
+        """Return the version 'current' names, or None if it names nothing.
+
+        Reports what is recorded as being in service, not whether it still
+        works: a dangling link still names its version. None means the link is
+        absent or is not a symlink.
+        """
+        try:
+            target = os.readlink(self.current_link)
+        except OSError:
+            return None
+        return pathlib.PurePosixPath(target).name
+
+    def is_active_version(self, version: str, requirement: str) -> bool:
+        """Return whether version is in service and can still run the workload.
+
+        True requires that 'current' names version, that its virtualenv was
+        built for this exact requirement, and that its interpreter imports the
+        workload module. Anything else is False, including a version that is
+        installed but has not been activated.
+
+        Raises ValueError for a malformed version.
+        """
+        version = Version(version)
+        return self.get_active_version() == version and self._is_working(self.venvs_dir / version, requirement)
+
+    def install(self, wheelhouse_tar: pathlib.Path, version: str, requirement: str) -> None:
+        """Build the virtualenv for version from an offline wheelhouse archive.
+
+        The virtualenv is created at venvs/<version>, the path it will be served
+        from, and is populated from the wheels in wheelhouse_tar alone -- pip is
+        given no index. It survives only once its interpreter has imported the
+        workload module: a failure at any step removes it again, and the version
+        in service is untouched either way. Nothing is put into service here;
+        call activate() for that.
+
+        Returns without doing anything if venvs/<version> is already a working
+        install of requirement, which is what lets a charm call this on every
+        hook. Refuses if it exists and is anything else: that tree may be the
+        one the workload is running from, and it is not overwritten in place.
+
+        The archive is extracted below the directory TMPDIR names.
+
+        Raises ValueError for a malformed version, and ArtifactExtractionError
+        or WorkloadInstallError on failure.
+        """
+        version = Version(version)
+        venv_dir = self.venvs_dir / version
+        if self._is_working(venv_dir, requirement):
+            return
+
+        try:
+            venv_dir.mkdir(exist_ok=False)
+        except FileExistsError as err:
+            raise WorkloadInstallError(
+                f'{venv_dir} already exists and is not a working install of {requirement!r}'
+            ) from err
+        except OSError as err:
+            raise WorkloadInstallError(f'failed to create {venv_dir}: {err}') from err
+
+        with contextlib.ExitStack() as on_failure:
+            on_failure.callback(shutil.rmtree, venv_dir, ignore_errors=True)
+            with tempfile.TemporaryDirectory() as scratch:
+                wheels = pathlib.Path(scratch) / 'wheelhouse'
+                unpack_archive(wheelhouse_tar, wheels)
+                _run([_SYSTEM_PYTHON, '-m', 'venv', str(venv_dir)], f'virtualenv creation for {version}')
+                _run(
+                    [
+                        str(venv_dir / 'bin' / 'pip'),
+                        'install',
+                        '--isolated',
+                        '--no-index',
+                        '--find-links',
+                        str(wheels),
+                        '--force-reinstall',
+                        requirement,
+                    ],
+                    f'pip install of {requirement!r} for {version}',
+                )
+            failure = self._import_failure(venv_dir)
+            if failure is not None:
+                raise WorkloadInstallError(f'self-check of {version} failed: {failure}')
+            try:
+                with utils.open_file_secure(
+                    venv_dir / _REQUIREMENT_STAMP_NAME,
+                    mode=0o644,
+                    create_parents=False,
+                ) as stamp:
+                    stamp.write(f'{requirement}\n')
+            except OSError as err:
+                raise WorkloadInstallError(f'failed to write the requirement stamp for {version}: {err}') from err
+            on_failure.pop_all()
+
+    def activate(self, version: str) -> None:
+        """Put version into service by pointing 'current' at its virtualenv.
+
+        Whatever 'current' was -- a link to another version, or a stray regular
+        file -- is replaced atomically. The workload keeps running from the
+        files it has already opened until the caller restarts it.
+
+        Raises ValueError for a malformed version, and WorkloadError if the
+        version is not installed or the link cannot be replaced.
+        """
+        version = Version(version)
+        venv_dir = self.venvs_dir / version
+        if not venv_dir.is_dir():
+            raise WorkloadError(f'cannot activate {version}: {venv_dir} is not a directory')
+        try:
+            with _directory_fd(self.install_root) as root_fd:
+                _replace_symlink(root_fd, _CURRENT_LINK_NAME, f'{_VENVS_DIR_NAME}/{version}')
+        except OSError as err:
+            raise WorkloadError(f'failed to point {self.current_link} at {version}: {err}') from err
+
+    def prune(self, keep: int = 2) -> list[str]:
+        """Delete all but the newest virtualenvs, returning the versions removed.
+
+        Retains the version in service and, up to keep directories in total,
+        the most recently built of the rest, because a rollback needs the
+        previous one. The version 'current' names is retained whether or not it
+        is among the newest, so pruning cannot delete the deployment the
+        workload is running from.
+
+        Raises ValueError if keep is less than one, and WorkloadError if the
+        venvs directory cannot be read or an entry cannot be deleted.
+        """
+        if keep < 1:
+            raise ValueError('keep must be at least 1')
+
+        active = self.get_active_version()
+        removed: list[str] = []
+        try:
+            with _directory_fd(self.venvs_dir) as venvs_fd:
+                # Only directories are versions to count or delete, and a
+                # symlink is never followed to decide that.
+                dated: list[tuple[float, str]] = []
+                for name in os.listdir(venvs_fd):
+                    entry = os.stat(name, dir_fd=venvs_fd, follow_symlinks=False)
+                    if stat.S_ISDIR(entry.st_mode):
+                        dated.append((entry.st_mtime, name))
+                versions = [name for _, name in sorted(dated, reverse=True)]
+
+                retained: set[str] = set()
+                if active is not None and active in versions:
+                    retained.add(active)
+                for version in versions:
+                    if len(retained) >= keep:
+                        break
+                    retained.add(version)
+                removed = [version for version in versions if version not in retained]
+                for version in removed:
+                    shutil.rmtree(version, dir_fd=venvs_fd)
+        except OSError as err:
+            raise WorkloadError(f'failed to prune {self.venvs_dir}: {err}') from err
+        return sorted(removed)
+
+    def _is_working(self, venv_dir: pathlib.Path, requirement: str) -> bool:
+        """Return whether venv_dir is a complete install of requirement."""
+        try:
+            stamped = (venv_dir / _REQUIREMENT_STAMP_NAME).read_text(encoding='utf-8')
+        except OSError:
+            return False
+        return stamped.strip() == requirement.strip() and self._import_failure(venv_dir) is None
+
+    def _import_failure(self, venv_dir: pathlib.Path) -> str | None:
+        """Return why venv_dir cannot import the workload module, or None.
+
+        A missing interpreter, a non-zero exit, and a hang all answer the one
+        question this asks -- can this virtualenv run the workload -- so each is
+        reported as a reason rather than raised. A caller that must fail loudly
+        turns the reason into an error.
+        """
+        python_bin = venv_dir / 'bin' / 'python3'
+        if not python_bin.is_file():
+            return f'no interpreter at {python_bin}'
+        try:
+            result = subprocess.run(
+                [str(python_bin), '-c', f'import {self.import_name}'],
+                check=False,
+                capture_output=True,
+                env=utils.clean_env(),
+                timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return f'import of {self.import_name} did not finish within {_SUBPROCESS_TIMEOUT_SECONDS} seconds'
+        except OSError as err:
+            return f'failed to run {python_bin}: {err}'
+        if result.returncode != 0:
+            return f'{self.import_name} could not be imported{utils.stderr_detail(result.stderr)}'
+        return None

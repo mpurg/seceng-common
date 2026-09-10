@@ -7,8 +7,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
-import typing
 
 import pytest
 
@@ -63,22 +61,3 @@ def test_stderr_detail_reports_the_last_meaningful_line(stderr: bytes, expected:
 
 def test_stderr_detail_truncates_a_line_too_long_for_a_status_message() -> None:
     assert utils.stderr_detail(b'x' * 500) == ': ' + 'x' * 200
-
-
-def test_run_forwards_arguments_to_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorded: dict[str, object] = {}
-
-    def fake_subprocess_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        recorded.update(kw)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(subprocess, 'run', fake_subprocess_run)
-
-    utils.run(['/usr/bin/true'], check=False, capture=True, timeout=123.0)
-
-    assert recorded['check'] is False
-    assert recorded['capture_output'] is True
-    assert recorded['timeout'] == 123.0
-    env = typing.cast(dict[str, str], recorded['env'])
-    assert 'PATH' in env
-    assert 'VIRTUAL_ENV' not in env

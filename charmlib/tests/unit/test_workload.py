@@ -2,67 +2,35 @@
 #
 # SPDX-License-Identifier: LGPL-3.0-only
 
-"""Unit tests for charmlibs.seceng.workload primitives and workflow."""
+"""Unit tests for archive extraction and the versioned wheelhouse deployment."""
 
 from __future__ import annotations
 
+import collections.abc
 import io
 import os
 import pathlib
+import stat
 import subprocess
 import tarfile
 import typing
 
 import pytest
+from conftest import FakeSubprocess, Responder
 
 from charmlibs.seceng import utils
 from charmlibs.seceng.workload import (
     ArtifactExtractionError,
+    Version,
+    Wheelhouse,
     WorkloadError,
     WorkloadInstallError,
-    flip_symlink,
-    get_active_version,
-    install_and_activate_wheelhouse,
-    is_version_installed,
-    prune_versions,
     unpack_archive,
-    validate_version,
 )
 
-
-# ============================================================================
-# Layer 1: Version Validation
-# ============================================================================
-
-
-def test_validate_version_valid_tags() -> None:
-    assert validate_version('1.0.0') == '1.0.0'
-    assert validate_version('v1.2.3_rc1-beta') == 'v1.2.3_rc1-beta'
-    assert validate_version('0.1.0') == '0.1.0'
-
-
-@pytest.mark.parametrize(
-    'invalid',
-    [
-        '',
-        '-1.0.0',
-        '../1.0.0',
-        '1.0.0/../../etc',
-        '1.0;rm -rf /',
-        '1.0?foo=bar',
-        '1.0#frag',
-        '1.0 2.0',
-        '1.0\n2.0',
-    ],
-)
-def test_validate_version_rejects_unsafe(invalid: str) -> None:
-    with pytest.raises(WorkloadError):
-        validate_version(invalid)
-
-
-# ============================================================================
-# Layer 1: Tarball Extraction Hardening (unpack_archive)
-# ============================================================================
+_IMPORT_NAME = 'my_pkg'
+_REQUIREMENT = 'my-pkg==1.0.0'
+_WHEEL = 'wheelhouse/my_pkg-1.0.0-py3-none-any.whl'
 
 
 def _create_tar(path: pathlib.Path, members: dict[str, bytes]) -> None:
@@ -72,6 +40,45 @@ def _create_tar(path: pathlib.Path, members: dict[str, bytes]) -> None:
             info.size = len(data)
             info.mtime = 1000
             tar.addfile(info, io.BytesIO(data))
+
+
+# ============================================================================
+# Release tags
+# ============================================================================
+
+
+@pytest.mark.parametrize('tag', ['1.0.0', 'v1.2.3_rc1-beta', '0.1.0', '1', 'a.b-c_d'])
+def test_version_accepts_a_release_tag(tag: str) -> None:
+    assert Version(tag) == tag
+
+
+@pytest.mark.parametrize(
+    'invalid',
+    [
+        '',
+        '.',
+        '..',
+        '-1.0.0',
+        '_1.0.0',
+        '../1.0.0',
+        '1.0.0/../../etc',
+        '1.0;rm -rf /',
+        '1.0?foo=bar',
+        '1.0#frag',
+        '1.0 2.0',
+        '1.0\n2.0',
+        '1.0\x00',
+        'ünicode',
+    ],
+)
+def test_version_rejects_anything_that_is_not_a_single_path_component(invalid: str) -> None:
+    with pytest.raises(ValueError, match='version'):
+        Version(invalid)
+
+
+# ============================================================================
+# Archive extraction
+# ============================================================================
 
 
 def test_unpack_archive_preserves_the_archive_layout(tmp_path: pathlib.Path) -> None:
@@ -109,7 +116,7 @@ def test_unpack_archive_extracts_members_without_a_common_root(tmp_path: pathlib
 
 def test_unpack_archive_is_non_destructive_to_input_archive(tmp_path: pathlib.Path) -> None:
     archive = tmp_path / 'keep.tar.gz'
-    _create_tar(archive, {'wheelhouse/pkg.whl': b'fake-wheel'})
+    _create_tar(archive, {_WHEEL: b'fake-wheel'})
     initial_bytes = archive.read_bytes()
 
     dest = tmp_path / 'dest'
@@ -182,7 +189,7 @@ def test_unpack_archive_rejects_symlink_with_filter_data(tmp_path: pathlib.Path)
 
 def test_unpack_archive_removes_the_destination_when_extraction_fails(tmp_path: pathlib.Path) -> None:
     archive = tmp_path / 'truncated.tar.gz'
-    _create_tar(archive, {'wheelhouse/pkg.whl': b'x' * 4096})
+    _create_tar(archive, {_WHEEL: b'x' * 4096})
     archive.write_bytes(archive.read_bytes()[: len(archive.read_bytes()) // 2])
     dest = tmp_path / 'dest'
 
@@ -193,445 +200,516 @@ def test_unpack_archive_removes_the_destination_when_extraction_fails(tmp_path: 
 
 
 # ============================================================================
-# Layer 1: Symlink and Pruning Helpers
+# Wheelhouse fixtures
 # ============================================================================
 
 
-def test_flip_symlink_atomic(tmp_path: pathlib.Path) -> None:
-    link = tmp_path / 'current'
-    target_v1 = tmp_path / 'venvs' / '1.0.0'
-    target_v1.mkdir(parents=True)
-    target_v2 = tmp_path / 'venvs' / '2.0.0'
-    target_v2.mkdir(parents=True)
+def _venv_steps(
+    *,
+    venv: int | Exception = 0,
+    pip: int | Exception = 0,
+    self_check: int | Exception = 0,
+    observe: collections.abc.Callable[[list[str]], None] | None = None,
+) -> Responder:
+    """Answer for the three steps install() runs, dispatching on argv shape.
 
-    flip_symlink(link, target_v1)
-    assert link.is_symlink()
-    assert os.readlink(link) == 'venvs/1.0.0'
+    A successful venv step materialises bin/python3 and bin/pip, which is what
+    the real one leaves behind for the steps that follow. observe sees each argv
+    before the call returns, which is how a test inspects the filesystem the
+    subprocess would have seen.
+    """
 
-    flip_symlink(link, target_v2)
-    assert os.readlink(link) == 'venvs/2.0.0'
+    def respond(argv: list[str]) -> int | Exception:
+        if argv[1:3] == ['-m', 'venv']:
+            outcome = venv
+            if venv == 0:
+                bin_dir = pathlib.Path(argv[3]) / 'bin'
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                (bin_dir / 'python3').touch()
+                (bin_dir / 'pip').touch()
+        elif 'install' in argv:
+            outcome = pip
+        else:
+            outcome = self_check
+        if observe is not None:
+            observe(argv)
+        return outcome
 
-
-def test_flip_symlink_refuses_regular_file(tmp_path: pathlib.Path) -> None:
-    link = tmp_path / 'current'
-    link.write_text('regular file')
-    target = tmp_path / 'venvs' / '1.0.0'
-
-    with pytest.raises(WorkloadError, match='is not a symlink'):
-        flip_symlink(link, target)
-
-
-def test_prune_versions_preserves_active(tmp_path: pathlib.Path) -> None:
-    venvs = tmp_path / 'venvs'
-    venvs.mkdir()
-
-    v1 = venvs / '1.0.0'
-    v2 = venvs / '2.0.0'
-    v3 = venvs / '3.0.0'
-    v4 = venvs / '4.0.0'
-
-    for v, mtime in [(v1, 100), (v2, 200), (v3, 300), (v4, 400)]:
-        v.mkdir()
-        os.utime(v, (mtime, mtime))
-
-    # active is v1 (the oldest by mtime)
-    removed = prune_versions(venvs, active_version='1.0.0', keep=2)
-
-    # Must preserve v1 (active) and v4 (newest). v2 and v3 removed.
-    assert removed == ['2.0.0', '3.0.0']
-    assert v1.exists()
-    assert v4.exists()
-    assert not v2.exists()
-    assert not v3.exists()
+    return respond
 
 
-def test_prune_versions_removes_transient_hidden_directories(tmp_path: pathlib.Path) -> None:
-    venvs = tmp_path / 'venvs'
-    venvs.mkdir()
-    (venvs / '1.0.0').mkdir()
-    (venvs / '.2.0.0.staging').mkdir()
-    (venvs / '.3.0.0.old').mkdir()
+@pytest.fixture
+def install_root(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Lay out the deployment tree a charm is expected to have created."""
+    root = tmp_path / 'srv' / 'workload'
+    (root / 'venvs').mkdir(parents=True)
+    return root
 
-    removed = prune_versions(venvs, active_version='1.0.0', keep=2)
 
-    # Transient directories are not version directories and never count
-    # against the retention budget.
-    assert removed == []
-    assert (venvs / '1.0.0').exists()
-    assert not (venvs / '.2.0.0.staging').exists()
-    assert not (venvs / '.3.0.0.old').exists()
+@pytest.fixture
+def wheelhouse(install_root: pathlib.Path, writable_root: None) -> Wheelhouse:
+    return Wheelhouse(install_root, _IMPORT_NAME)
+
+
+@pytest.fixture
+def wheelhouse_tar(tmp_path: pathlib.Path) -> pathlib.Path:
+    archive = tmp_path / 'wheelhouse.tar.gz'
+    _create_tar(archive, {_WHEEL: b'fake wheel'})
+    return archive
 
 
 # ============================================================================
-# Query Helpers
+# Building a version
 # ============================================================================
 
 
-def test_get_active_version(tmp_path: pathlib.Path) -> None:
-    assert get_active_version(tmp_path) is None
-
-    link = tmp_path / 'current'
-    os.symlink(pathlib.Path('venvs') / '1.2.3', link)
-    assert get_active_version(tmp_path) == '1.2.3'
+@pytest.mark.parametrize('invalid', ['', 'my-pkg', 'pkg.', '.pkg', 'pkg..sub', '1pkg', 'pkg sub'])
+def test_wheelhouse_rejects_an_import_name_that_is_not_a_module_path(install_root: pathlib.Path, invalid: str) -> None:
+    with pytest.raises(ValueError, match='import name'):
+        Wheelhouse(install_root, invalid)
 
 
-def test_is_version_installed(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    v_dir = tmp_path / 'venvs' / '1.0.0'
-    bin_dir = v_dir / 'bin'
-    bin_dir.mkdir(parents=True)
-    python_bin = bin_dir / 'python3'
-    python_bin.touch()
-    req_file = v_dir / '.wheelhouse-requirement'
-    req_file.write_text('my-package==1.0.0\n')
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        if 'bad_import' in cmd[-1]:
-            return subprocess.CompletedProcess(cmd, returncode=1)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-
-    # Success case
-    assert is_version_installed(tmp_path, '1.0.0', 'my-package==1.0.0', 'good_mod') is True
-    # Missing version
-    assert is_version_installed(tmp_path, '2.0.0', 'my-package==1.0.0', 'good_mod') is False
-    # Requirement mismatch (e.g. extras changed)
-    assert is_version_installed(tmp_path, '1.0.0', 'my-package[extra]==1.0.0', 'good_mod') is False
-    # Self-check failure
-    assert is_version_installed(tmp_path, '1.0.0', 'my-package==1.0.0', 'bad_import') is False
-
-
-# ============================================================================
-# Layer 2: Python Wheelhouse Workflow & Transactional Safety
-# ============================================================================
-
-
-def test_install_and_activate_wheelhouse_success(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
+def test_install_builds_the_virtualenv_where_it_will_be_served_from(
+    fake_subprocess: FakeSubprocess,
+    wheelhouse: Wheelhouse,
+    wheelhouse_tar: pathlib.Path,
+    install_root: pathlib.Path,
 ) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
+    """Built at its final path, so no shebang or activation script has to be rewritten."""
+    recorded = fake_subprocess(_venv_steps())
 
-    commands: list[list[str]] = []
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
 
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        commands.append(cmd)
-        # Mock venv creation creating bin/python3 and bin/pip
-        if '-m' in cmd and 'venv' in cmd:
-            venv_path = pathlib.Path(cmd[-1])
-            (venv_path / 'bin').mkdir(parents=True, exist_ok=True)
-            (venv_path / 'bin' / 'python3').touch()
-            (venv_path / 'bin' / 'pip').touch()
-        return subprocess.CompletedProcess(cmd, returncode=0)
+    venv_dir = install_root / 'venvs' / '1.0.0'
+    stamp = venv_dir / '.wheelhouse-requirement'
+    assert (venv_dir / 'bin' / 'python3').is_file()
+    assert stamp.read_text(encoding='utf-8') == f'{_REQUIREMENT}\n'
+    assert stat.S_IMODE(stamp.stat().st_mode) == 0o644
+    # Building a version does not put it into service.
+    assert wheelhouse.get_active_version() is None
+    assert not (install_root / 'current').exists(follow_symlinks=False)
 
-    monkeypatch.setattr(utils, 'run', fake_run)
+    venv_call, pip_call, check_call = (call.argv for call in recorded)
+    assert venv_call == ['/usr/bin/python3', '-m', 'venv', str(venv_dir)]
+    assert pip_call[0] == str(venv_dir / 'bin' / 'pip')
+    assert pip_call[1:5] == ['install', '--isolated', '--no-index', '--find-links']
+    assert pip_call[6:] == ['--force-reinstall', _REQUIREMENT]
+    assert check_call == [str(venv_dir / 'bin' / 'python3'), '-c', f'import {_IMPORT_NAME}']
 
-    install_and_activate_wheelhouse(
-        wheelhouse_dir=wheelhouse_dir,
-        install_root=install_root,
-        version='1.0.0',
-        requirement='my-pkg==1.0.0',
-        import_name='my_pkg',
+
+def test_install_feeds_pip_the_extracted_wheels_and_then_discards_them(
+    fake_subprocess: FakeSubprocess,
+    wheelhouse: Wheelhouse,
+    wheelhouse_tar: pathlib.Path,
+    install_root: pathlib.Path,
+) -> None:
+    seen_by_pip: list[list[str]] = []
+
+    def observe(argv: list[str]) -> None:
+        if 'install' not in argv:
+            return
+        wheels = pathlib.Path(argv[argv.index('--find-links') + 1])
+        seen_by_pip.append(sorted(str(path.relative_to(wheels)) for path in wheels.rglob('*')))
+
+    recorded = fake_subprocess(_venv_steps(observe=observe))
+
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    assert seen_by_pip == [['wheelhouse', _WHEEL]]
+    pip_call = recorded[1].argv
+    wheels = pathlib.Path(pip_call[pip_call.index('--find-links') + 1])
+    # The wheels are scratch space, outside the deployment tree and gone again.
+    assert not wheels.exists()
+    assert install_root not in wheels.parents
+
+
+def test_install_subprocesses_are_bounded_and_free_of_the_charm_virtualenv(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_subprocess: FakeSubprocess,
+    wheelhouse: Wheelhouse,
+    wheelhouse_tar: pathlib.Path,
+) -> None:
+    monkeypatch.setenv('VIRTUAL_ENV', '/var/lib/juju/agents/unit-x/charm/venv')
+    monkeypatch.setenv('PYTHONPATH', '/var/lib/juju/agents/unit-x/charm/lib')
+    monkeypatch.setenv('HTTPS_PROXY', 'http://proxy:3128')
+    recorded = fake_subprocess(_venv_steps())
+
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    for call in recorded:
+        assert 'VIRTUAL_ENV' not in call.env
+        assert 'PYTHONPATH' not in call.env
+        assert call.env['HTTPS_PROXY'] == 'http://proxy:3128'
+        assert call.timeout == 300
+
+
+def test_install_is_a_no_op_when_the_version_is_already_installed(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path
+) -> None:
+    """A charm reconciling on every hook must not rebuild what is already there."""
+    fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    recorded = fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    # Only the import check that established the existing build still works.
+    assert [call.argv[1:] for call in recorded] == [['-c', f'import {_IMPORT_NAME}']]
+
+
+def test_install_refuses_a_version_directory_it_did_not_build(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    """The tree may be what the workload is running from; it is not overwritten."""
+    venv_dir = install_root / 'venvs' / '1.0.0'
+    venv_dir.mkdir()
+    (venv_dir / 'left-behind').write_text('previous contents')
+    recorded = fake_subprocess(_venv_steps())
+
+    with pytest.raises(WorkloadInstallError, match='already exists and is not a working install'):
+        wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    assert (venv_dir / 'left-behind').read_text() == 'previous contents'
+    assert recorded == []
+
+
+def test_install_refuses_to_create_the_venvs_directory(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    (install_root / 'venvs').rmdir()
+    fake_subprocess(_venv_steps())
+
+    with pytest.raises(WorkloadInstallError, match='failed to create'):
+        wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    assert not (install_root / 'venvs').exists()
+
+
+@pytest.mark.parametrize(
+    ('failure', 'message'),
+    [
+        ({'venv': 1}, 'virtualenv creation for 1.0.0 failed with exit status 1'),
+        ({'venv': FileNotFoundError('/usr/bin/python3')}, 'failed to start virtualenv creation for 1.0.0'),
+        ({'pip': 2}, "pip install of 'my-pkg==1.0.0' for 1.0.0 failed with exit status 2"),
+        ({'pip': subprocess.TimeoutExpired(['pip'], 300)}, 'pip install .* did not finish within 300 seconds'),
+        ({'self_check': 1}, 'self-check of 1.0.0 failed: my_pkg could not be imported'),
+        ({'self_check': subprocess.TimeoutExpired(['python3'], 300)}, 'import of my_pkg did not finish within 300'),
+    ],
+)
+def test_install_removes_the_virtualenv_when_a_step_fails(
+    fake_subprocess: FakeSubprocess,
+    wheelhouse: Wheelhouse,
+    wheelhouse_tar: pathlib.Path,
+    install_root: pathlib.Path,
+    failure: dict[str, int | Exception],
+    message: str,
+) -> None:
+    fake_subprocess(_venv_steps(**failure))  # type: ignore[arg-type]  # the parametrised keyword names one step
+
+    with pytest.raises(WorkloadInstallError, match=message):
+        wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    # An incomplete virtualenv must not outlive the attempt that built it.
+    assert not (install_root / 'venvs' / '1.0.0').exists()
+    assert list((install_root / 'venvs').iterdir()) == []
+
+
+def test_install_reports_pips_diagnosis(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path
+) -> None:
+    fake_subprocess(
+        _venv_steps(pip=1),
+        stderr=b'ERROR: No matching distribution found for my-pkg==1.0.0\n',
     )
 
-    # 1. current symlink points to venvs/1.0.0
-    assert get_active_version(install_root) == '1.0.0'
-    # 2. installed-version stamp is not written (current symlink is sole physical source of truth)
-    assert not (install_root / 'installed-version').exists()
-    # 3. requirement stamp written
-    stamp = install_root / 'venvs' / '1.0.0' / '.wheelhouse-requirement'
-    assert stamp.read_text().strip() == 'my-pkg==1.0.0'
+    with pytest.raises(WorkloadInstallError, match='ERROR: No matching distribution found'):
+        wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
 
 
-def test_install_and_activate_wheelhouse_pip_failure_transactional_cleanup(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
+def test_install_removes_the_virtualenv_when_the_requirement_stamp_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_subprocess: FakeSubprocess,
+    wheelhouse: Wheelhouse,
+    wheelhouse_tar: pathlib.Path,
+    install_root: pathlib.Path,
 ) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
+    """A virtualenv with no stamp would be reinstalled forever; it is not kept."""
+    fake_subprocess(_venv_steps())
+    write_file = utils.open_file_secure
 
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        if '-m' in cmd and 'venv' in cmd:
-            venv_path = pathlib.Path(cmd[-1])
-            (venv_path / 'bin').mkdir(parents=True, exist_ok=True)
-            (venv_path / 'bin' / 'python3').touch()
-            (venv_path / 'bin' / 'pip').touch()
-            return subprocess.CompletedProcess(cmd, returncode=0)
-        if 'install' in cmd:
-            raise subprocess.CalledProcessError(1, cmd, stderr=b'pip failed resolution')
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-
-    with pytest.raises(WorkloadInstallError, match='pip install failed'):
-        install_and_activate_wheelhouse(
-            wheelhouse_dir=wheelhouse_dir,
-            install_root=install_root,
-            version='1.0.0',
-            requirement='my-pkg==1.0.0',
-            import_name='my_pkg',
-        )
-
-    # Transactional Safety: Candidate directory deleted, no current symlink created
-    assert not (install_root / 'venvs' / '1.0.0').exists()
-    assert not (install_root / 'current').exists()
-
-
-def test_install_and_activate_wheelhouse_self_check_failure_transactional_cleanup(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
-
-    # Pre-existing working version 0.9.0
-    v09 = install_root / 'venvs' / '0.9.0'
-    v09.mkdir(parents=True)
-    current = install_root / 'current'
-    flip_symlink(current, v09)
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        if '-m' in cmd and 'venv' in cmd:
-            venv_path = pathlib.Path(cmd[-1])
-            (venv_path / 'bin').mkdir(parents=True, exist_ok=True)
-            (venv_path / 'bin' / 'python3').touch()
-            (venv_path / 'bin' / 'pip').touch()
-            return subprocess.CompletedProcess(cmd, returncode=0)
-        if 'import broken_mod' in cmd[-1]:
-            return subprocess.CompletedProcess(cmd, returncode=1, stderr=b'ImportError: broken')
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-
-    with pytest.raises(WorkloadInstallError, match='failed self-check'):
-        install_and_activate_wheelhouse(
-            wheelhouse_dir=wheelhouse_dir,
-            install_root=install_root,
-            version='1.0.0',
-            requirement='my-pkg==1.0.0',
-            import_name='broken_mod',
-        )
-
-    # Failed v1.0.0 cleaned up completely
-    assert not (install_root / 'venvs' / '1.0.0').exists()
-    # Pre-existing active version undisturbed!
-    assert get_active_version(install_root) == '0.9.0'
-
-
-def test_install_and_activate_wheelhouse_requirement_stamp_oserror_transactional_cleanup(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        if '-m' in cmd and 'venv' in cmd:
-            venv_path = pathlib.Path(cmd[-1])
-            (venv_path / 'bin').mkdir(parents=True, exist_ok=True)
-            (venv_path / 'bin' / 'python3').touch()
-            (venv_path / 'bin' / 'pip').touch()
-            return subprocess.CompletedProcess(cmd, returncode=0)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-
-    orig_open_file_secure = utils.open_file_secure
-
-    def mock_open_file_secure(path: pathlib.Path, **kwargs: object) -> typing.Any:
+    def fail_on_the_stamp(path: pathlib.Path, **kwargs: object) -> typing.Any:
         if path.name == '.wheelhouse-requirement':
-            raise OSError('Disk full')
-        return orig_open_file_secure(path, **kwargs)  # type: ignore[call-overload]  # mock forwards kwargs to overloaded function
+            raise OSError('No space left on device')
+        return write_file(path, **kwargs)  # type: ignore[call-overload]  # the fake forwards the caller's keywords
 
-    monkeypatch.setattr(utils, 'open_file_secure', mock_open_file_secure)
+    monkeypatch.setattr(utils, 'open_file_secure', fail_on_the_stamp)
 
-    with pytest.raises(WorkloadInstallError, match='Failed to write requirement stamp: Disk full'):
-        install_and_activate_wheelhouse(
-            wheelhouse_dir=wheelhouse_dir,
-            install_root=install_root,
-            version='1.0.0',
-            requirement='my-pkg==1.0.0',
-            import_name='my_pkg',
-        )
+    with pytest.raises(WorkloadInstallError, match='failed to write the requirement stamp'):
+        wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
 
-    # Failed v1.0.0 directory cleaned up
+    assert not (install_root / 'venvs' / '1.0.0').exists()
+
+
+def test_install_leaves_the_deployment_in_service_untouched_when_it_fails(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '0.9.0', _REQUIREMENT)
+    wheelhouse.activate('0.9.0')
+
+    fake_subprocess(_venv_steps(pip=1))
+    with pytest.raises(WorkloadInstallError, match='pip install'):
+        wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+
+    assert wheelhouse.get_active_version() == '0.9.0'
+    assert wheelhouse.is_active_version('0.9.0', _REQUIREMENT)
     assert not (install_root / 'venvs' / '1.0.0').exists()
 
 
-def test_install_and_activate_wheelhouse_no_installed_version_stamp(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
+def test_install_reports_an_archive_it_cannot_extract(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, install_root: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
+    recorded = fake_subprocess(_venv_steps())
 
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        if '-m' in cmd and 'venv' in cmd:
-            venv_path = pathlib.Path(cmd[-1])
-            (venv_path / 'bin').mkdir(parents=True, exist_ok=True)
-            (venv_path / 'bin' / 'python3').touch()
-            (venv_path / 'bin' / 'pip').touch()
-            return subprocess.CompletedProcess(cmd, returncode=0)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-
-    install_and_activate_wheelhouse(
-        wheelhouse_dir=wheelhouse_dir,
-        install_root=install_root,
-        version='1.0.0',
-        requirement='my-pkg==1.0.0',
-        import_name='my_pkg',
-    )
-
-    assert not (install_root / 'installed-version').exists()
-    assert get_active_version(install_root) == '1.0.0'
-
-
-def _fake_venv_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-    cmd = list(cmd)
-    if '-m' in cmd and 'venv' in cmd:
-        venv_path = pathlib.Path(cmd[-1])
-        (venv_path / 'bin').mkdir(parents=True, exist_ok=True)
-        (venv_path / 'bin' / 'python3').touch()
-        (venv_path / 'bin' / 'pip').touch()
-    return subprocess.CompletedProcess(cmd, returncode=0)
-
-
-def test_install_and_activate_wheelhouse_failure_preserves_active_version(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A failed reinstall of the active version must not destroy the running venv."""
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
-
-    monkeypatch.setattr(utils, 'run', _fake_venv_run)
-    install_and_activate_wheelhouse(
-        wheelhouse_dir=wheelhouse_dir,
-        install_root=install_root,
-        version='1.0.0',
-        requirement='my-pkg==1.0.0',
-        import_name='my_pkg',
-    )
-    stamp = install_root / 'venvs' / '1.0.0' / '.wheelhouse-requirement'
-    assert stamp.read_text().strip() == 'my-pkg==1.0.0'
-
-    # The requirement changes while the version tag stays the same; pip now fails.
-    def failing_pip_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        cmd = list(cmd)
-        if 'install' in cmd:
-            raise subprocess.CalledProcessError(1, cmd, stderr=b'pip failed resolution')
-        return _fake_venv_run(cmd, **kw)
-
-    monkeypatch.setattr(utils, 'run', failing_pip_run)
-
-    with pytest.raises(WorkloadInstallError, match='pip install failed'):
-        install_and_activate_wheelhouse(
-            wheelhouse_dir=wheelhouse_dir,
-            install_root=install_root,
-            version='1.0.0',
-            requirement='my-pkg[extra]==1.0.0',
-            import_name='my_pkg',
-        )
-
-    # The previously activated deployment is untouched and still resolves.
-    assert get_active_version(install_root) == '1.0.0'
-    assert (install_root / 'current').resolve() == (install_root / 'venvs' / '1.0.0').resolve()
-    assert stamp.read_text().strip() == 'my-pkg==1.0.0'
-    # The failed staging candidate was cleaned up.
-    assert not (install_root / 'venvs' / '.1.0.0.staging').exists()
-
-
-def test_install_and_activate_wheelhouse_reinstall_replaces_active_venv(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
-
-    monkeypatch.setattr(utils, 'run', _fake_venv_run)
-
-    install_and_activate_wheelhouse(
-        wheelhouse_dir=wheelhouse_dir,
-        install_root=install_root,
-        version='1.0.0',
-        requirement='my-pkg==1.0.0',
-        import_name='my_pkg',
-    )
-    # Reinstalling the same version with a different requirement replaces the venv.
-    install_and_activate_wheelhouse(
-        wheelhouse_dir=wheelhouse_dir,
-        install_root=install_root,
-        version='1.0.0',
-        requirement='my-pkg[extra]==1.0.0',
-        import_name='my_pkg',
-    )
-
-    stamp = install_root / 'venvs' / '1.0.0' / '.wheelhouse-requirement'
-    assert stamp.read_text().strip() == 'my-pkg[extra]==1.0.0'
-    assert get_active_version(install_root) == '1.0.0'
-    # Neither the staging directory nor the swap backup leaks.
-    assert list((install_root / 'venvs').glob('.*')) == []
-
-
-def test_install_and_activate_wheelhouse_rewrites_staging_paths(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        cmd = list(cmd)
-        if '-m' in cmd and 'venv' in cmd:
-            venv_path = pathlib.Path(cmd[-1])
-            (venv_path / 'bin').mkdir(parents=True, exist_ok=True)
-            (venv_path / 'bin' / 'python3').touch()
-            # Console scripts get the build-time venv path baked into their shebang.
-            (venv_path / 'bin' / 'entrypoint').write_text(f'#!{venv_path}/bin/python3\n')
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-
-    install_and_activate_wheelhouse(
-        wheelhouse_dir=wheelhouse_dir,
-        install_root=install_root,
-        version='1.0.0',
-        requirement='my-pkg==1.0.0',
-        import_name='my_pkg',
-    )
-
-    entrypoint = install_root / 'venvs' / '1.0.0' / 'bin' / 'entrypoint'
-    assert entrypoint.read_text() == f'#!{install_root}/venvs/1.0.0/bin/python3\n'
-
-
-def test_install_and_activate_wheelhouse_pip_timeout(
-    tmp_path: pathlib.Path, writable_root: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    install_root = tmp_path / 'workload'
-    wheelhouse_dir = tmp_path / 'wheelhouse'
-    wheelhouse_dir.mkdir()
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        cmd = list(cmd)
-        if '-m' in cmd and 'venv' in cmd:
-            return _fake_venv_run(cmd, **kw)
-        if 'install' in cmd:
-            raise subprocess.TimeoutExpired(cmd, 300)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-
-    with pytest.raises(WorkloadInstallError, match='pip install timed out'):
-        install_and_activate_wheelhouse(
-            wheelhouse_dir=wheelhouse_dir,
-            install_root=install_root,
-            version='1.0.0',
-            requirement='my-pkg==1.0.0',
-            import_name='my_pkg',
-        )
+    with pytest.raises(ArtifactExtractionError, match='archive file not found'):
+        wheelhouse.install(tmp_path / 'absent.tar.gz', '1.0.0', _REQUIREMENT)
 
     assert not (install_root / 'venvs' / '1.0.0').exists()
-    assert not (install_root / 'venvs' / '.1.0.0.staging').exists()
+    assert recorded == []
+
+
+def test_install_rejects_a_malformed_version(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    fake_subprocess(_venv_steps())
+
+    with pytest.raises(ValueError, match='version'):
+        wheelhouse.install(wheelhouse_tar, '../escape', _REQUIREMENT)
+
+    assert list((install_root / 'venvs').iterdir()) == []
+
+
+# ============================================================================
+# Putting a version into service
+# ============================================================================
+
+
+def test_activate_points_current_at_the_version(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+    wheelhouse.install(wheelhouse_tar, '2.0.0', _REQUIREMENT)
+
+    wheelhouse.activate('1.0.0')
+    # Relative, so the tree can be moved or bind-mounted elsewhere.
+    assert os.readlink(install_root / 'current') == 'venvs/1.0.0'
+
+    wheelhouse.activate('2.0.0')
+    assert os.readlink(install_root / 'current') == 'venvs/2.0.0'
+    assert wheelhouse.get_active_version() == '2.0.0'
+
+
+def test_activate_replaces_a_stray_file_standing_where_current_belongs(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    """Repairing an errant regular file is valid; refusing to would need a racy check."""
+    fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+    (install_root / 'current').write_text('not a symlink')
+
+    wheelhouse.activate('1.0.0')
+
+    assert os.readlink(install_root / 'current') == 'venvs/1.0.0'
+
+
+def test_activate_reuses_the_staged_name_left_by_an_interrupted_run(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+    os.symlink('venvs/0.0.0', install_root / '.current.tmp')
+
+    wheelhouse.activate('1.0.0')
+
+    assert os.readlink(install_root / 'current') == 'venvs/1.0.0'
+    assert not (install_root / '.current.tmp').exists(follow_symlinks=False)
+
+
+def test_activate_refuses_a_version_that_is_not_installed(wheelhouse: Wheelhouse, install_root: pathlib.Path) -> None:
+    with pytest.raises(WorkloadError, match='cannot activate 1.0.0'):
+        wheelhouse.activate('1.0.0')
+
+    assert not (install_root / 'current').exists(follow_symlinks=False)
+
+
+def test_activate_reports_a_current_it_cannot_replace(
+    fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path, install_root: pathlib.Path
+) -> None:
+    fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+    (install_root / 'current').mkdir()
+
+    with pytest.raises(WorkloadError, match='failed to point'):
+        wheelhouse.activate('1.0.0')
+
+    # The staged link is not left behind for the next run to trip over.
+    assert not (install_root / '.current.tmp').exists(follow_symlinks=False)
+
+
+@pytest.mark.parametrize('target', ['venvs/1.2.3', 'venvs/1.2.3/'])
+def test_get_active_version_reads_the_link(install_root: pathlib.Path, target: str) -> None:
+    os.symlink(target, install_root / 'current')
+
+    assert Wheelhouse(install_root, _IMPORT_NAME).get_active_version() == '1.2.3'
+
+
+def test_get_active_version_reports_nothing_without_a_link(install_root: pathlib.Path) -> None:
+    wheelhouse = Wheelhouse(install_root, _IMPORT_NAME)
+    assert wheelhouse.get_active_version() is None
+
+    (install_root / 'current').write_text('not a symlink')
+    assert wheelhouse.get_active_version() is None
+
+
+# ============================================================================
+# Deciding whether a deployment still works
+# ============================================================================
+
+
+@pytest.fixture
+def active(fake_subprocess: FakeSubprocess, wheelhouse: Wheelhouse, wheelhouse_tar: pathlib.Path) -> Wheelhouse:
+    """Return a wheelhouse with 1.0.0 built and in service."""
+    fake_subprocess(_venv_steps())
+    wheelhouse.install(wheelhouse_tar, '1.0.0', _REQUIREMENT)
+    wheelhouse.activate('1.0.0')
+    return wheelhouse
+
+
+def test_is_active_version_accepts_a_working_deployment(fake_subprocess: FakeSubprocess, active: Wheelhouse) -> None:
+    fake_subprocess(_venv_steps())
+
+    assert active.is_active_version('1.0.0', _REQUIREMENT)
+
+
+def test_is_active_version_rejects_a_version_that_was_never_activated(
+    fake_subprocess: FakeSubprocess, active: Wheelhouse, wheelhouse_tar: pathlib.Path
+) -> None:
+    fake_subprocess(_venv_steps())
+    active.install(wheelhouse_tar, '2.0.0', _REQUIREMENT)
+
+    assert not active.is_active_version('2.0.0', _REQUIREMENT)
+
+
+def test_is_active_version_rejects_a_changed_requirement(fake_subprocess: FakeSubprocess, active: Wheelhouse) -> None:
+    """The tag says nothing about the extras or pins the venv was built with."""
+    fake_subprocess(_venv_steps())
+
+    assert not active.is_active_version('1.0.0', 'my-pkg[extra]==1.0.0')
+
+
+def test_is_active_version_rejects_a_venv_that_cannot_import_the_workload(
+    fake_subprocess: FakeSubprocess, active: Wheelhouse
+) -> None:
+    fake_subprocess(_venv_steps(self_check=1))
+
+    assert not active.is_active_version('1.0.0', _REQUIREMENT)
+
+
+def test_is_active_version_rejects_a_venv_whose_import_hangs(
+    fake_subprocess: FakeSubprocess, active: Wheelhouse
+) -> None:
+    fake_subprocess(_venv_steps(self_check=subprocess.TimeoutExpired(['python3'], 300)))
+
+    assert not active.is_active_version('1.0.0', _REQUIREMENT)
+
+
+def test_is_active_version_rejects_a_venv_without_an_interpreter(
+    active: Wheelhouse, install_root: pathlib.Path
+) -> None:
+    (install_root / 'venvs' / '1.0.0' / 'bin' / 'python3').unlink()
+
+    assert not active.is_active_version('1.0.0', _REQUIREMENT)
+
+
+def test_is_active_version_rejects_a_venv_whose_interpreter_cannot_be_run(
+    fake_subprocess: FakeSubprocess, active: Wheelhouse
+) -> None:
+    fake_subprocess(_venv_steps(self_check=PermissionError('Permission denied')))
+
+    assert not active.is_active_version('1.0.0', _REQUIREMENT)
+
+
+# ============================================================================
+# Pruning old versions
+# ============================================================================
+
+
+def _make_versions(venvs_dir: pathlib.Path, ages: dict[str, int]) -> None:
+    """Create version directories with distinct modification times."""
+    for version, mtime in ages.items():
+        (venvs_dir / version).mkdir()
+        os.utime(venvs_dir / version, (mtime, mtime))
+
+
+def test_prune_keeps_the_version_in_service_and_the_newest_others(install_root: pathlib.Path) -> None:
+    _make_versions(install_root / 'venvs', {'1.0.0': 100, '2.0.0': 200, '3.0.0': 300, '4.0.0': 400})
+    os.symlink('venvs/3.0.0', install_root / 'current')
+
+    assert Wheelhouse(install_root, _IMPORT_NAME).prune() == ['1.0.0', '2.0.0']
+    assert sorted(path.name for path in (install_root / 'venvs').iterdir()) == ['3.0.0', '4.0.0']
+
+
+def test_prune_keeps_the_version_in_service_even_when_it_is_the_oldest(install_root: pathlib.Path) -> None:
+    """Pruning must never delete the tree the workload is running from."""
+    _make_versions(install_root / 'venvs', {'1.0.0': 100, '2.0.0': 200, '3.0.0': 300, '4.0.0': 400})
+    os.symlink('venvs/1.0.0', install_root / 'current')
+
+    assert Wheelhouse(install_root, _IMPORT_NAME).prune() == ['2.0.0', '3.0.0']
+    assert sorted(path.name for path in (install_root / 'venvs').iterdir()) == ['1.0.0', '4.0.0']
+
+
+def test_prune_can_be_asked_to_keep_only_what_is_in_service(install_root: pathlib.Path) -> None:
+    _make_versions(install_root / 'venvs', {'1.0.0': 100, '2.0.0': 200})
+    os.symlink('venvs/1.0.0', install_root / 'current')
+
+    assert Wheelhouse(install_root, _IMPORT_NAME).prune(keep=1) == ['2.0.0']
+    assert [path.name for path in (install_root / 'venvs').iterdir()] == ['1.0.0']
+
+
+def test_prune_keeps_the_newest_when_nothing_is_in_service(install_root: pathlib.Path) -> None:
+    _make_versions(install_root / 'venvs', {'1.0.0': 100, '2.0.0': 200, '3.0.0': 300})
+
+    assert Wheelhouse(install_root, _IMPORT_NAME).prune() == ['1.0.0']
+    assert sorted(path.name for path in (install_root / 'venvs').iterdir()) == ['2.0.0', '3.0.0']
+
+
+def test_prune_protects_nothing_extra_when_current_dangles(install_root: pathlib.Path) -> None:
+    """A 'current' naming a version that is gone reserves no retention slot."""
+    _make_versions(install_root / 'venvs', {'1.0.0': 100, '2.0.0': 200, '3.0.0': 300})
+    os.symlink('venvs/9.9.9', install_root / 'current')
+
+    assert Wheelhouse(install_root, _IMPORT_NAME).prune() == ['1.0.0']
+    assert sorted(path.name for path in (install_root / 'venvs').iterdir()) == ['2.0.0', '3.0.0']
+
+
+def test_prune_leaves_alone_what_is_not_a_version_directory(install_root: pathlib.Path) -> None:
+    venvs = install_root / 'venvs'
+    _make_versions(venvs, {'1.0.0': 100})
+    (venvs / 'notes.txt').write_text('not a deployment')
+    os.symlink('1.0.0', venvs / 'previous')
+
+    assert Wheelhouse(install_root, _IMPORT_NAME).prune(keep=1) == []
+    assert sorted(path.name for path in venvs.iterdir()) == ['1.0.0', 'notes.txt', 'previous']
+
+
+def test_prune_rejects_a_retention_that_would_empty_the_tree(install_root: pathlib.Path) -> None:
+    with pytest.raises(ValueError, match='keep must be at least 1'):
+        Wheelhouse(install_root, _IMPORT_NAME).prune(keep=0)
+
+
+def test_prune_reports_a_missing_venvs_directory(install_root: pathlib.Path) -> None:
+    (install_root / 'venvs').rmdir()
+
+    with pytest.raises(WorkloadError, match='failed to prune'):
+        Wheelhouse(install_root, _IMPORT_NAME).prune()

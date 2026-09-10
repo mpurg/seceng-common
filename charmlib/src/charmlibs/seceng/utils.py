@@ -20,7 +20,6 @@ import pathlib
 import pwd
 import re
 import stat
-import subprocess
 import typing
 from collections import deque
 
@@ -398,24 +397,3 @@ def stderr_detail(stderr: bytes) -> str:
     """
     lines = [line.strip() for line in stderr.decode('utf-8', errors='replace').splitlines() if line.strip()]
     return f': {lines[-1][:_STDERR_DETAIL_LIMIT]}' if lines else ''
-
-
-def run(
-    cmd: collections.abc.Sequence[str],
-    *,
-    check: bool = True,
-    capture: bool = False,
-    timeout: float | None = None,
-) -> subprocess.CompletedProcess[bytes]:
-    """Run a command with the sanitised environment.
-
-    Raises subprocess.CalledProcessError when check is set and the command
-    fails, and subprocess.TimeoutExpired when timeout is set and exceeded.
-    """
-    return subprocess.run(
-        cmd,
-        check=check,
-        env=clean_env(),
-        capture_output=capture,
-        timeout=timeout,
-    )
