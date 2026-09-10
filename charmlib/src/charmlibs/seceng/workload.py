@@ -5,20 +5,18 @@
 """Stateless workload deployment and lifecycle primitives for SecEng charms.
 
 This module provides pure Python, ops-free primitives and workflows for
-acquiring release artifacts, unpacking archives safely, building isolated
-virtual environments, atomically activating workloads via symlink flips,
-and checking service status.
+unpacking archives safely, building isolated virtual environments, atomically
+activating workloads via symlink flips, and checking service status. Release
+artifacts are acquired by charmlibs.seceng.github.
 """
 
 from __future__ import annotations
 
 __all__ = [
     'ArtifactExtractionError',
-    'ArtifactFetchError',
     'WorkloadError',
     'WorkloadInstallError',
     'daemon_reload',
-    'fetch_github_release_asset',
     'flip_symlink',
     'get_active_version',
     'install_and_activate_wheelhouse',
@@ -29,13 +27,9 @@ __all__ = [
     'service_restart',
     'unpack_archive',
     'validate_version',
-    'verify_sha256',
 ]
 
 import copy
-import hashlib
-import http.client
-import json
 import logging
 import os
 import pathlib
@@ -44,17 +38,10 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-import time
-import urllib.error
-import urllib.request
 
 from . import utils
 
 _VERSION_PATTERN = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]*\Z')
-_HTTP_TIMEOUT_SECONDS = 30
-_DOWNLOAD_MAX_SECONDS = 300
-_DOWNLOAD_CHUNK_BYTES = 64 * 1024
-_HASH_CHUNK_BYTES = 1024 * 1024
 _SELF_CHECK_REASON_LIMIT = 200
 # Bound for every local subprocess (venv creation, pip, import self-check,
 # systemctl); without it a hung child blocks the hook until Juju kills it.
@@ -63,10 +50,6 @@ _SUBPROCESS_TIMEOUT_SECONDS = 300
 
 class WorkloadError(Exception):
     """Base error for workload operations, safe for Juju status messages."""
-
-
-class ArtifactFetchError(WorkloadError):
-    """Artifact retrieval failed (network, auth, HTTP status)."""
 
 
 class ArtifactExtractionError(WorkloadError):
@@ -91,142 +74,6 @@ def validate_version(version: str) -> str:
             'and hyphen, starting with a letter or digit.'
         )
     return version
-
-
-def _validate_token(token: str) -> str:
-    """Validate that token contains only printable ASCII characters."""
-    if not token:
-        raise ArtifactFetchError('GitHub token must not be empty.')
-    if any(not '\x21' <= character <= '\x7e' for character in token):
-        raise ArtifactFetchError('GitHub token must not contain whitespace, newlines, or non-ASCII characters.')
-    return token
-
-
-def _github_request(url: str, token: str, accept: str) -> urllib.request.Request:
-    """Build an authenticated GitHub request whose credential does not follow redirects."""
-    request = urllib.request.Request(
-        url,
-        headers={
-            'Accept': accept,
-            'User-Agent': 'canonical-seceng-workload',
-            'X-GitHub-Api-Version': '2022-11-28',
-        },
-    )
-    request.add_unredirected_header('Authorization', f'Bearer {_validate_token(token)}')
-    return request
-
-
-def fetch_github_release_asset(
-    repo: str,
-    tag: str,
-    asset_name: str,
-    target_path: pathlib.Path,
-    token: str,
-) -> None:
-    """Download a release asset from GitHub via the Releases API.
-
-    The Authorization header is added as an unredirected header to prevent
-    bearer token leakage on redirects to presigned storage. Tokens and presigned
-    URLs are never included in logs or exception messages.
-
-    Raises ArtifactFetchError if the release, asset, or download fails.
-    """
-    tag = validate_version(tag)
-    _validate_token(token)
-
-    api_url = f'https://api.github.com/repos/{repo}/releases/tags/{tag}'
-    req = _github_request(api_url, token, 'application/vnd.github+json')
-
-    try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read())
-    except urllib.error.HTTPError as err:
-        err.close()
-        if err.code == 401:
-            raise ArtifactFetchError(
-                'GitHub returned 401 during release lookup: token was rejected as invalid or expired.'
-            ) from err
-        if err.code == 404:
-            raise ArtifactFetchError(f'GitHub returned 404 during release lookup of tag {tag!r} in {repo!r}.') from err
-        raise ArtifactFetchError(
-            f'GitHub returned HTTP {err.code} during release lookup of tag {tag!r} in {repo!r}.'
-        ) from err
-    except (OSError, http.client.HTTPException) as err:
-        raise ArtifactFetchError(f'Network error during release lookup of tag {tag!r} in {repo!r}.') from err
-    except json.JSONDecodeError as err:
-        raise ArtifactFetchError(f'GitHub returned invalid JSON for release tag {tag!r} in {repo!r}.') from err
-
-    if not isinstance(payload, dict) or not isinstance(payload.get('assets'), list):
-        raise ArtifactFetchError(f'GitHub release tag {tag!r} in {repo!r} has no valid assets list.')
-
-    asset = next((a for a in payload['assets'] if isinstance(a, dict) and a.get('name') == asset_name), None)
-    if asset is None:
-        raise ArtifactFetchError(f'Asset {asset_name!r} not found in release {tag!r} of {repo!r}.')
-
-    asset_url = asset.get('url')
-    if not isinstance(asset_url, str):
-        raise ArtifactFetchError(f'Asset {asset_name!r} in release {tag!r} of {repo!r} missing API URL.')
-
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    download_req = _github_request(asset_url, token, 'application/octet-stream')
-    deadline = time.monotonic() + _DOWNLOAD_MAX_SECONDS
-
-    try:
-        with (
-            urllib.request.urlopen(download_req, timeout=_HTTP_TIMEOUT_SECONDS) as response,
-            target_path.open('wb') as f,
-        ):
-            while True:
-                chunk = response.read(_DOWNLOAD_CHUNK_BYTES)
-                if not chunk:
-                    break
-                f.write(chunk)
-                if time.monotonic() > deadline:
-                    raise ArtifactFetchError(f'Asset download timed out after {_DOWNLOAD_MAX_SECONDS} seconds.')
-    except urllib.error.HTTPError as err:
-        err.close()
-        target_path.unlink(missing_ok=True)
-        if err.code == 401:
-            raise ArtifactFetchError(
-                'GitHub returned 401 during asset download: token was rejected as invalid or expired.'
-            ) from err
-        if err.code == 404:
-            raise ArtifactFetchError(
-                f'GitHub returned 404 during download of asset {asset_name!r} from {repo!r}.'
-            ) from err
-        raise ArtifactFetchError(
-            f'GitHub returned HTTP {err.code} during download of asset {asset_name!r} from {repo!r}.'
-        ) from err
-    except Exception as err:
-        target_path.unlink(missing_ok=True)
-        if isinstance(err, ArtifactFetchError):
-            raise
-        raise ArtifactFetchError(f'Failed to download asset {asset_name!r} from {repo!r}.') from err
-
-
-def verify_sha256(file_path: pathlib.Path, expected: str) -> None:
-    """Verify that file_path has the expected SHA-256 digest (case-insensitive).
-
-    Computes the digest in 1 MiB chunks. Raises ArtifactFetchError if the
-    file cannot be read or if the computed digest does not match expected.
-    """
-    cleaned_expected = expected.strip().lower()
-    if not cleaned_expected:
-        raise ArtifactFetchError('Expected SHA-256 digest must not be empty.')
-
-    try:
-        hasher = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            while chunk := f.read(_HASH_CHUNK_BYTES):
-                hasher.update(chunk)
-        actual = hasher.hexdigest().lower()
-    except OSError as err:
-        raise ArtifactFetchError(f'Failed to compute SHA-256 for {file_path.name}: {err}') from err
-
-    if actual != cleaned_expected:
-        raise ArtifactFetchError(
-            f'SHA-256 mismatch for {file_path.name}: expected {cleaned_expected}, computed {actual}'
-        )
 
 
 def _swap_directory(staging_dir: pathlib.Path, dest_dir: pathlib.Path) -> None:

@@ -6,27 +6,21 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
-import json
 import os
 import pathlib
 import subprocess
 import tarfile
 import typing
-import urllib.error
-import urllib.request
 
 import pytest
 
 from charmlibs.seceng import utils
 from charmlibs.seceng.workload import (
     ArtifactExtractionError,
-    ArtifactFetchError,
     WorkloadError,
     WorkloadInstallError,
     daemon_reload,
-    fetch_github_release_asset,
     flip_symlink,
     get_active_version,
     install_and_activate_wheelhouse,
@@ -37,7 +31,6 @@ from charmlibs.seceng.workload import (
     service_restart,
     unpack_archive,
     validate_version,
-    verify_sha256,
 )
 
 
@@ -69,54 +62,6 @@ def test_validate_version_valid_tags() -> None:
 def test_validate_version_rejects_unsafe(invalid: str) -> None:
     with pytest.raises(WorkloadError):
         validate_version(invalid)
-
-
-# ============================================================================
-# Layer 1: Checksum Verification (verify_sha256)
-# ============================================================================
-
-
-def test_verify_sha256_match(tmp_path: pathlib.Path) -> None:
-    test_file = tmp_path / 'payload.tar.gz'
-    content = b'sample payload data for sha256 verification'
-    test_file.write_bytes(content)
-    expected = hashlib.sha256(content).hexdigest()
-
-    verify_sha256(test_file, expected.upper())
-    verify_sha256(test_file, f'  {expected} \n')
-
-
-def test_verify_sha256_mismatch_raises(tmp_path: pathlib.Path) -> None:
-    test_file = tmp_path / 'payload.tar.gz'
-    test_file.write_bytes(b'real content')
-    wrong_hash = 'e' * 64
-
-    with pytest.raises(ArtifactFetchError, match='SHA-256 mismatch for payload.tar.gz'):
-        verify_sha256(test_file, wrong_hash)
-
-
-def test_verify_sha256_empty_expected_raises(tmp_path: pathlib.Path) -> None:
-    test_file = tmp_path / 'payload.tar.gz'
-    test_file.write_bytes(b'content')
-
-    with pytest.raises(ArtifactFetchError, match='Expected SHA-256 digest must not be empty'):
-        verify_sha256(test_file, '   ')
-
-
-def test_verify_sha256_missing_file_raises(tmp_path: pathlib.Path) -> None:
-    missing_file = tmp_path / 'nonexistent.tar.gz'
-
-    with pytest.raises(ArtifactFetchError, match='Failed to compute SHA-256 for nonexistent.tar.gz'):
-        verify_sha256(missing_file, 'a' * 64)
-
-
-def test_verify_sha256_large_file_chunked(tmp_path: pathlib.Path) -> None:
-    test_file = tmp_path / 'large.bin'
-    chunk = b'A' * (1024 * 1024) + b'B' * (512 * 1024)
-    test_file.write_bytes(chunk)
-    expected = hashlib.sha256(chunk).hexdigest()
-
-    verify_sha256(test_file, expected)
 
 
 # ============================================================================
@@ -242,107 +187,6 @@ def test_unpack_archive_restores_previous_dest_on_swap_failure(
     assert not (dest / 'new.txt').exists()
     # Neither the staging directory nor the swap backup leaks.
     assert [entry.name for entry in tmp_path.iterdir() if entry.name.startswith('.')] == []
-
-
-# ============================================================================
-# Layer 1: GitHub Release Asset Download (fetch_github_release_asset)
-# ============================================================================
-
-
-def test_fetch_github_token_validation(tmp_path: pathlib.Path) -> None:
-    target = tmp_path / 'out.tar.gz'
-    with pytest.raises(ArtifactFetchError, match='must not be empty'):
-        fetch_github_release_asset('org/repo', '1.0.0', 'asset.tar.gz', target, '')
-
-    with pytest.raises(ArtifactFetchError, match='whitespace'):
-        fetch_github_release_asset('org/repo', '1.0.0', 'asset.tar.gz', target, 'bad token with spaces')
-
-
-def test_fetch_github_release_asset_unredirected_header(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / 'download.tar.gz'
-    token = 'ghp_secretToken12345'
-    recorded_requests: list[urllib.request.Request] = []
-
-    class MockResponse:
-        def __init__(self, data: bytes):
-            self._stream = io.BytesIO(data)
-
-        def read(self, amt: int | None = None) -> bytes:
-            return self._stream.read(amt if amt is not None else -1)
-
-        def __enter__(self) -> MockResponse:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-    def fake_urlopen(req: urllib.request.Request, timeout: int = 30) -> MockResponse:
-        recorded_requests.append(req)
-        if 'releases/tags' in req.full_url:
-            payload = {
-                'assets': [
-                    {'name': 'bundle.tar.gz', 'url': 'https://api.github.com/repos/org/repo/releases/assets/999'}
-                ]
-            }
-            return MockResponse(json.dumps(payload).encode('utf-8'))
-        elif 'assets/999' in req.full_url:
-            return MockResponse(b'binary-payload-data')
-        raise ValueError(f'Unexpected URL: {req.full_url}')
-
-    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
-
-    fetch_github_release_asset('org/repo', '1.0.0', 'bundle.tar.gz', target, token)
-
-    assert target.read_bytes() == b'binary-payload-data'
-    assert len(recorded_requests) == 2
-
-    # Invariant: Authorization is set via add_unredirected_header
-    for req in recorded_requests:
-        assert req.get_header('Authorization') == f'Bearer {token}'
-        assert req.unredirected_hdrs['Authorization'] == f'Bearer {token}'
-        assert 'Authorization' not in req.headers
-
-
-def test_fetch_github_release_asset_not_found(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    target = tmp_path / 'download.tar.gz'
-
-    class MockResponse:
-        def read(self, *args: object) -> bytes:
-            return json.dumps({'assets': []}).encode('utf-8')
-
-        def __enter__(self) -> MockResponse:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-    monkeypatch.setattr(urllib.request, 'urlopen', lambda req, **kw: MockResponse())
-
-    with pytest.raises(ArtifactFetchError, match="Asset 'missing.tar.gz' not found"):
-        fetch_github_release_asset('org/repo', '1.0.0', 'missing.tar.gz', target, 'token123')
-
-    assert not target.exists()
-
-
-def test_fetch_github_release_asset_cleans_up_on_failure(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / 'download.tar.gz'
-
-    def fake_urlopen(req: urllib.request.Request, **kw: object) -> object:
-        if 'releases/tags' in req.full_url:
-            payload = {'assets': [{'name': 'asset.tar.gz', 'url': 'https://example.com/asset'}]}
-            return io.BytesIO(json.dumps(payload).encode('utf-8'))
-        raise urllib.error.HTTPError(req.full_url, 404, 'Not Found', hdrs=None, fp=None)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
-
-    with pytest.raises(ArtifactFetchError, match='404'):
-        fetch_github_release_asset('org/repo', '1.0.0', 'asset.tar.gz', target, 'token123')
-
-    assert not target.exists()
 
 
 # ============================================================================
