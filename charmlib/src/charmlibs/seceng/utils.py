@@ -8,6 +8,8 @@ Module providing utility functions and types for charms used by the Security
 Engineering team at Canonical.
 """
 
+from __future__ import annotations
+
 import collections.abc
 import contextlib
 import functools
@@ -18,6 +20,7 @@ import pathlib
 import pwd
 import re
 import stat
+import subprocess
 import typing
 from collections import deque
 
@@ -345,3 +348,77 @@ def copy_file_secure(
     except SameDigest:
         pass
     return digest
+
+
+def envquote(value: str) -> str:
+    """Quote a value for interpolation into a systemd EnvironmentFile= line.
+
+    Escapes backslashes, double quotes, backticks, and dollar signs, wrapping
+    the result in double quotes. Do not add outer quotes around the
+    interpolation: systemd recognises no escape sequences inside single quotes,
+    so a value containing a single quote breaks parsing and re-enables
+    assignment injection.
+
+    Newlines and multi-line values pass through intact.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f'envquote() requires a str, got {type(value).__name__}')
+    if '\x00' in value:
+        raise ValueError('envquote() does not support NUL characters')
+    # Backslash must be escaped first, or the backslashes introduced by the
+    # later replacements would be doubled in turn.
+    escaped = value.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
+    return f'"{escaped}"'
+
+
+def clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a sanitised subprocess environment.
+
+    Only the system path, root home, locale, and proxy variables from the
+    current process are inherited. ``VIRTUAL_ENV`` and ``PYTHONPATH`` are
+    always removed, including when supplied through ``extra``.
+    """
+    env: dict[str, str] = {
+        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        'HOME': '/root',
+        'LANG': 'C.UTF-8',
+    }
+    for variable in (
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+        'NO_PROXY',
+        'ALL_PROXY',
+        'http_proxy',
+        'https_proxy',
+        'no_proxy',
+        'all_proxy',
+    ):
+        if variable in os.environ:
+            env[variable] = os.environ[variable]
+    if extra is not None:
+        env.update(extra)
+    env.pop('VIRTUAL_ENV', None)
+    env.pop('PYTHONPATH', None)
+    return env
+
+
+def run(
+    cmd: collections.abc.Sequence[str],
+    *,
+    check: bool = True,
+    extra_env: dict[str, str] | None = None,
+    capture: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run a command with the sanitised environment.
+
+    Raises subprocess.CalledProcessError when check is set and the command
+    fails, and subprocess.TimeoutExpired when timeout is set and exceeded.
+    """
+    return subprocess.run(
+        cmd,
+        check=check,
+        env=clean_env(extra_env),
+        capture_output=capture,
+        timeout=timeout,
+    )
