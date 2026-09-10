@@ -2,10 +2,11 @@
 #
 # SPDX-License-Identifier: LGPL-3.0-only
 
-"""Tests for the sanitised subprocess environment helpers."""
+"""Tests for the subprocess environment helpers."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import typing
 
@@ -14,20 +15,33 @@ import pytest
 from charmlibs.seceng import utils
 
 
-def test_clean_env_inherits_proxies_and_drops_python_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_clean_env_inherits_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv('HTTP_PROXY', 'http://proxy:3128')
-    monkeypatch.setenv('http_proxy', 'http://proxy:3128')
+    monkeypatch.setenv('JUJU_UNIT_NAME', 'my-charm/0')
+
+    env = utils.clean_env()
+
+    assert env['HTTP_PROXY'] == 'http://proxy:3128'
+    assert env['JUJU_UNIT_NAME'] == 'my-charm/0'
+    assert env['PATH'] == os.environ['PATH']
+
+
+def test_clean_env_strips_interpreter_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv('VIRTUAL_ENV', '/home/user/venv')
     monkeypatch.setenv('PYTHONPATH', '/home/user/lib')
 
-    env = utils.clean_env({'VIRTUAL_ENV': '/attacker/venv'})
+    env = utils.clean_env()
 
-    assert env['HTTP_PROXY'] == 'http://proxy:3128'
-    assert env['http_proxy'] == 'http://proxy:3128'
-    assert env['PATH'] == '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
-    assert env['HOME'] == '/root'
     assert 'VIRTUAL_ENV' not in env
     assert 'PYTHONPATH' not in env
+
+
+def test_clean_env_does_not_mutate_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('VIRTUAL_ENV', '/home/user/venv')
+
+    utils.clean_env()
+
+    assert os.environ['VIRTUAL_ENV'] == '/home/user/venv'
 
 
 def test_run_forwards_arguments_to_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -371,32 +371,14 @@ def envquote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Return a sanitised subprocess environment.
+def clean_env() -> dict[str, str]:
+    """Return the ambient environment without ``VIRTUAL_ENV`` or ``PYTHONPATH``.
 
-    Only the system path, root home, locale, and proxy variables from the
-    current process are inherited. ``VIRTUAL_ENV`` and ``PYTHONPATH`` are
-    always removed, including when supplied through ``extra``.
+    The charm runs inside its own virtualenv, and either variable would leak it
+    into an unrelated workload interpreter. Everything else is inherited, so
+    proxy configuration and locale reach the subprocess.
     """
-    env: dict[str, str] = {
-        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        'HOME': '/root',
-        'LANG': 'C.UTF-8',
-    }
-    for variable in (
-        'HTTP_PROXY',
-        'HTTPS_PROXY',
-        'NO_PROXY',
-        'ALL_PROXY',
-        'http_proxy',
-        'https_proxy',
-        'no_proxy',
-        'all_proxy',
-    ):
-        if variable in os.environ:
-            env[variable] = os.environ[variable]
-    if extra is not None:
-        env.update(extra)
+    env = os.environ.copy()
     env.pop('VIRTUAL_ENV', None)
     env.pop('PYTHONPATH', None)
     return env
@@ -406,7 +388,6 @@ def run(
     cmd: collections.abc.Sequence[str],
     *,
     check: bool = True,
-    extra_env: dict[str, str] | None = None,
     capture: bool = False,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -418,7 +399,7 @@ def run(
     return subprocess.run(
         cmd,
         check=check,
-        env=clean_env(extra_env),
+        env=clean_env(),
         capture_output=capture,
         timeout=timeout,
     )
