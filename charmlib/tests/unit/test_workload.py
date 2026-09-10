@@ -74,7 +74,8 @@ def _create_tar(path: pathlib.Path, members: dict[str, bytes]) -> None:
             tar.addfile(info, io.BytesIO(data))
 
 
-def test_unpack_archive_strips_single_top_level_dir(tmp_path: pathlib.Path) -> None:
+def test_unpack_archive_preserves_the_archive_layout(tmp_path: pathlib.Path) -> None:
+    """A top-level directory in the archive is part of the artifact, not noise."""
     archive = tmp_path / 'bundle.tar.gz'
     _create_tar(
         archive,
@@ -86,12 +87,11 @@ def test_unpack_archive_strips_single_top_level_dir(tmp_path: pathlib.Path) -> N
     dest = tmp_path / 'output'
     unpack_archive(archive, dest)
 
-    assert (dest / 'file1.txt').read_bytes() == b'hello'
-    assert (dest / 'subdir' / 'file2.txt').read_bytes() == b'world'
-    assert not (dest / 'bundle').exists()
+    assert (dest / 'bundle' / 'file1.txt').read_bytes() == b'hello'
+    assert (dest / 'bundle' / 'subdir' / 'file2.txt').read_bytes() == b'world'
 
 
-def test_unpack_archive_preserves_archive_without_single_root(tmp_path: pathlib.Path) -> None:
+def test_unpack_archive_extracts_members_without_a_common_root(tmp_path: pathlib.Path) -> None:
     archive = tmp_path / 'multi.tar.gz'
     _create_tar(
         archive,
@@ -119,26 +119,50 @@ def test_unpack_archive_is_non_destructive_to_input_archive(tmp_path: pathlib.Pa
     assert archive.read_bytes() == initial_bytes
 
 
-def test_unpack_archive_replaces_existing_dest_cleanly(tmp_path: pathlib.Path) -> None:
+def test_unpack_archive_refuses_an_existing_destination(tmp_path: pathlib.Path) -> None:
+    """Extracting over a live tree would corrupt whatever is reading from it."""
     dest = tmp_path / 'dest'
     dest.mkdir()
     (dest / 'old.txt').write_text('old content')
 
     archive = tmp_path / 'new.tar.gz'
-    _create_tar(archive, {'root/new.txt': b'new content'})
+    _create_tar(archive, {'new.txt': b'new content'})
 
-    unpack_archive(archive, dest)
-    assert (dest / 'new.txt').read_bytes() == b'new content'
-    assert not (dest / 'old.txt').exists()
+    with pytest.raises(ArtifactExtractionError, match='failed to claim extraction directory'):
+        unpack_archive(archive, dest)
+
+    assert (dest / 'old.txt').read_text() == 'old content'
+    assert not (dest / 'new.txt').exists()
 
 
-def test_unpack_archive_rejects_path_traversal(tmp_path: pathlib.Path) -> None:
+def test_unpack_archive_refuses_to_create_the_parent_directory(tmp_path: pathlib.Path) -> None:
+    archive = tmp_path / 'bundle.tar.gz'
+    _create_tar(archive, {'file.txt': b'hello'})
+
+    with pytest.raises(ArtifactExtractionError, match='failed to claim extraction directory'):
+        unpack_archive(archive, tmp_path / 'absent' / 'dest')
+
+    assert not (tmp_path / 'absent').exists()
+
+
+def test_unpack_archive_reports_a_missing_archive(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(ArtifactExtractionError, match='archive file not found'):
+        unpack_archive(tmp_path / 'nothing.tar.gz', tmp_path / 'dest')
+
+    assert not (tmp_path / 'dest').exists()
+
+
+@pytest.mark.parametrize('member', ['bundle/../../evil.txt', '/etc/cron.d/evil', '..', ''])
+def test_unpack_archive_rejects_an_unsafe_member_path(tmp_path: pathlib.Path, member: str) -> None:
     archive = tmp_path / 'evil.tar.gz'
-    _create_tar(archive, {'bundle/../../evil.txt': b'bad'})
+    _create_tar(archive, {member: b'bad'})
     dest = tmp_path / 'dest'
 
     with pytest.raises(ArtifactExtractionError, match='unsafe member path'):
         unpack_archive(archive, dest)
+
+    # No member of a rejected archive is left behind.
+    assert not dest.exists()
 
 
 def test_unpack_archive_rejects_symlink_with_filter_data(tmp_path: pathlib.Path) -> None:
@@ -150,39 +174,22 @@ def test_unpack_archive_rejects_symlink_with_filter_data(tmp_path: pathlib.Path)
         tar.addfile(info)
 
     dest = tmp_path / 'dest'
-    with pytest.raises(ArtifactExtractionError):
+    with pytest.raises(ArtifactExtractionError, match='failed to extract archive'):
         unpack_archive(archive, dest)
 
+    assert not dest.exists()
 
-def test_unpack_archive_restores_previous_dest_on_swap_failure(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+
+def test_unpack_archive_removes_the_destination_when_extraction_fails(tmp_path: pathlib.Path) -> None:
+    archive = tmp_path / 'truncated.tar.gz'
+    _create_tar(archive, {'wheelhouse/pkg.whl': b'x' * 4096})
+    archive.write_bytes(archive.read_bytes()[: len(archive.read_bytes()) // 2])
     dest = tmp_path / 'dest'
-    dest.mkdir()
-    (dest / 'old.txt').write_text('old content')
 
-    archive = tmp_path / 'new.tar.gz'
-    _create_tar(archive, {'root/new.txt': b'new content'})
-
-    real_replace = os.replace
-    swap_attempts: list[str] = []
-
-    def failing_replace(src: typing.Any, dst: typing.Any, **kw: typing.Any) -> None:
-        if pathlib.Path(str(dst)) == dest:
-            swap_attempts.append(str(src))
-            if len(swap_attempts) == 1:
-                raise OSError('simulated swap failure')
-        return real_replace(src, dst, **kw)
-
-    monkeypatch.setattr(os, 'replace', failing_replace)
-
-    with pytest.raises(ArtifactExtractionError, match='Failed to atomically swap'):
+    with pytest.raises(ArtifactExtractionError, match='failed to extract archive'):
         unpack_archive(archive, dest)
 
-    assert (dest / 'old.txt').read_text() == 'old content'
-    assert not (dest / 'new.txt').exists()
-    # Neither the staging directory nor the swap backup leaks.
-    assert [entry.name for entry in tmp_path.iterdir() if entry.name.startswith('.')] == []
+    assert not dest.exists()
 
 
 # ============================================================================

@@ -26,7 +26,7 @@ __all__ = [
     'validate_version',
 ]
 
-import copy
+import contextlib
 import logging
 import os
 import pathlib
@@ -34,7 +34,6 @@ import re
 import shutil
 import subprocess
 import tarfile
-import tempfile
 
 from . import utils
 
@@ -99,63 +98,42 @@ def _swap_directory(staging_dir: pathlib.Path, dest_dir: pathlib.Path) -> None:
 
 
 def unpack_archive(archive_path: pathlib.Path, dest_dir: pathlib.Path) -> None:
-    """Extract a tarball archive (.tar.gz) into dest_dir with hardening.
+    """Extract a tar archive into dest_dir, which must not yet exist.
 
-    The archive is extracted using filter='data', which rejects device nodes
-    and links (hard or soft) whose targets are absolute or escape the
-    extraction root; in-tree relative links are preserved. Absolute paths and
-    '..' path traversal are additionally rejected. If all members share a
-    single top-level directory, that directory component is stripped.
-    Extraction is performed in a temporary sibling directory and atomically
-    swapped into dest_dir.
+    The destination is claimed with mkdir(exist_ok=False), so extraction only
+    ever populates a directory this call created and never writes into a tree a
+    workload may be reading. dest_dir.parent must already exist: creating it
+    would mean inventing the ownership and permissions that belong to the
+    caller.
 
-    Invariant: archive_path is treated as read-only and is never deleted or modified.
-    Raises ArtifactExtractionError on failure.
+    Device nodes, links whose targets escape the extraction root, and member
+    paths that are absolute, empty, or contain '..' are all refused. The
+    archive's own layout is preserved. dest_dir is removed again if anything
+    fails, so a partial extraction never outlives the failure.
+
+    Raises ArtifactExtractionError.
     """
     if not archive_path.is_file():
-        raise ArtifactExtractionError(f'Archive file not found: {archive_path}')
-
-    dest_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging = pathlib.Path(tempfile.mkdtemp(prefix=f'.{dest_dir.name}.', dir=str(dest_dir.parent)))
+        raise ArtifactExtractionError(f'archive file not found: {archive_path}')
 
     try:
+        dest_dir.mkdir(exist_ok=False)
+    except OSError as err:
+        raise ArtifactExtractionError(f'failed to claim extraction directory {dest_dir}: {err}') from err
+
+    with contextlib.ExitStack() as on_failure:
+        on_failure.callback(shutil.rmtree, dest_dir, ignore_errors=True)
         try:
             with tarfile.open(archive_path, mode='r:*') as archive:
                 members = archive.getmembers()
-                roots: set[str] = set()
                 for member in members:
-                    pure_path = pathlib.PurePosixPath(member.name)
-                    if pure_path.is_absolute() or '..' in pure_path.parts:
-                        raise ArtifactExtractionError(f'Archive contains unsafe member path: {member.name!r}')
-                    if pure_path.parts:
-                        roots.add(pure_path.parts[0])
-
-                has_single_root = len(roots) == 1
-                extract_members: list[tarfile.TarInfo] = []
-                if has_single_root:
-                    for member in members:
-                        parts = pathlib.PurePosixPath(member.name).parts
-                        if len(parts) <= 1:
-                            continue
-                        stripped_name = '/'.join(parts[1:])
-                        copied = copy.copy(member)
-                        copied.name = stripped_name
-                        extract_members.append(copied)
-                else:
-                    extract_members = members
-
-                archive.extractall(staging, members=extract_members, filter='data')
+                    member_path = pathlib.PurePosixPath(member.name)
+                    if not member_path.parts or member_path.is_absolute() or '..' in member_path.parts:
+                        raise ArtifactExtractionError(f'archive contains unsafe member path: {member.name!r}')
+                archive.extractall(dest_dir, members=members, filter='data')
         except (OSError, tarfile.TarError, EOFError) as err:
-            raise ArtifactExtractionError(f'Failed to safely extract archive {archive_path.name!r}: {err}') from err
-
-        try:
-            _swap_directory(staging, dest_dir)
-        except OSError as err:
-            raise ArtifactExtractionError(
-                f'Failed to atomically swap extracted directory into {dest_dir}: {err}'
-            ) from err
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+            raise ArtifactExtractionError(f'failed to extract archive {archive_path.name!r}: {err}') from err
+        on_failure.pop_all()
 
 
 def flip_symlink(current_link: pathlib.Path, target_dir: pathlib.Path) -> None:
