@@ -5,9 +5,10 @@
 """Stateless workload deployment and lifecycle primitives for SecEng charms.
 
 This module provides pure Python, ops-free primitives and workflows for
-unpacking archives safely, building isolated virtual environments, atomically
-activating workloads via symlink flips, and checking service status. Release
-artifacts are acquired by charmlibs.seceng.github.
+unpacking archives safely, building isolated virtual environments, and
+atomically activating workloads via symlink flips. Release artifacts are
+acquired by charmlibs.seceng.github, and the units that run a deployed workload
+are managed by charmlibs.seceng.systemd.
 """
 
 from __future__ import annotations
@@ -16,15 +17,11 @@ __all__ = [
     'ArtifactExtractionError',
     'WorkloadError',
     'WorkloadInstallError',
-    'daemon_reload',
     'flip_symlink',
     'get_active_version',
     'install_and_activate_wheelhouse',
-    'is_service_active',
     'is_version_installed',
     'prune_versions',
-    'service_enable',
-    'service_restart',
     'unpack_archive',
     'validate_version',
 ]
@@ -43,8 +40,8 @@ from . import utils
 
 _VERSION_PATTERN = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]*\Z')
 _SELF_CHECK_REASON_LIMIT = 200
-# Bound for every local subprocess (venv creation, pip, import self-check,
-# systemctl); without it a hung child blocks the hook until Juju kills it.
+# Bound for every local subprocess (venv creation, pip, import self-check);
+# without it a hung child blocks the hook until Juju kills it.
 _SUBPROCESS_TIMEOUT_SECONDS = 300
 
 
@@ -227,68 +224,6 @@ def prune_versions(versions_dir: pathlib.Path, active_version: str | None, keep:
             shutil.rmtree(entry, ignore_errors=True)
             removed.append(entry.name)
     return sorted(removed)
-
-
-def is_service_active(service_name: str) -> bool:
-    """Return whether systemd reports the service as active."""
-    try:
-        result = utils.run(
-            ['/usr/bin/systemctl', 'is-active', '--quiet', service_name],
-            check=False,
-            capture=True,
-            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
-def service_restart(service_name: str) -> None:
-    """Restart a systemd service.
-
-    Raises WorkloadError if restart fails or times out.
-    """
-    try:
-        utils.run(
-            ['/usr/bin/systemctl', 'restart', service_name],
-            check=True,
-            capture=True,
-            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as err:
-        raise WorkloadError(f"Failed to restart service '{service_name}': {err}") from err
-
-
-def service_enable(service_name: str) -> None:
-    """Enable a systemd service.
-
-    Raises WorkloadError if enable fails or times out.
-    """
-    try:
-        utils.run(
-            ['/usr/bin/systemctl', 'enable', service_name],
-            check=True,
-            capture=True,
-            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as err:
-        raise WorkloadError(f"Failed to enable service '{service_name}': {err}") from err
-
-
-def daemon_reload() -> None:
-    """Reload systemd manager configuration.
-
-    Raises WorkloadError if daemon-reload fails or times out.
-    """
-    try:
-        utils.run(
-            ['/usr/bin/systemctl', 'daemon-reload'],
-            check=True,
-            capture=True,
-            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as err:
-        raise WorkloadError(f'Failed to reload systemd daemon: {err}') from err
 
 
 def get_active_version(install_root: pathlib.Path) -> str | None:

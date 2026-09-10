@@ -20,15 +20,11 @@ from charmlibs.seceng.workload import (
     ArtifactExtractionError,
     WorkloadError,
     WorkloadInstallError,
-    daemon_reload,
     flip_symlink,
     get_active_version,
     install_and_activate_wheelhouse,
-    is_service_active,
     is_version_installed,
     prune_versions,
-    service_enable,
-    service_restart,
     unpack_archive,
     validate_version,
 )
@@ -260,7 +256,7 @@ def test_prune_versions_removes_transient_hidden_directories(tmp_path: pathlib.P
 
 
 # ============================================================================
-# Query Helpers and Service Primitives
+# Query Helpers
 # ============================================================================
 
 
@@ -270,71 +266,6 @@ def test_get_active_version(tmp_path: pathlib.Path) -> None:
     link = tmp_path / 'current'
     os.symlink(pathlib.Path('venvs') / '1.2.3', link)
     assert get_active_version(tmp_path) == '1.2.3'
-
-
-def test_is_service_active(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        returncode = 0 if 'running-svc' in cmd else 3
-        return subprocess.CompletedProcess(cmd, returncode=returncode)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-    assert is_service_active('running-svc') is True
-    assert is_service_active('dead-svc') is False
-
-
-def test_service_restart(monkeypatch: pytest.MonkeyPatch) -> None:
-    executed: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        executed.append(cmd)
-        if 'fail-svc' in cmd:
-            raise subprocess.CalledProcessError(1, cmd)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-    service_restart('good-svc')
-    assert executed == [['/usr/bin/systemctl', 'restart', 'good-svc']]
-
-    with pytest.raises(WorkloadError, match="Failed to restart service 'fail-svc'"):
-        service_restart('fail-svc')
-
-
-def test_service_enable(monkeypatch: pytest.MonkeyPatch) -> None:
-    executed: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        executed.append(cmd)
-        if 'fail-svc' in cmd:
-            raise subprocess.CalledProcessError(1, cmd)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-    service_enable('good-svc')
-    assert executed == [['/usr/bin/systemctl', 'enable', 'good-svc']]
-
-    with pytest.raises(WorkloadError, match="Failed to enable service 'fail-svc'"):
-        service_enable('fail-svc')
-
-
-def test_daemon_reload(monkeypatch: pytest.MonkeyPatch) -> None:
-    executed: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        executed.append(cmd)
-        if 'fail' in cmd:
-            raise subprocess.CalledProcessError(1, cmd)
-        return subprocess.CompletedProcess(cmd, returncode=0)
-
-    monkeypatch.setattr(utils, 'run', fake_run)
-    daemon_reload()
-    assert executed == [['/usr/bin/systemctl', 'daemon-reload']]
-
-    def fake_run_fail(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        raise subprocess.CalledProcessError(1, cmd)
-
-    monkeypatch.setattr(utils, 'run', fake_run_fail)
-    with pytest.raises(WorkloadError, match='Failed to reload systemd daemon'):
-        daemon_reload()
 
 
 def test_is_version_installed(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:

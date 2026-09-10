@@ -384,6 +384,22 @@ def clean_env() -> dict[str, str]:
     return env
 
 
+_STDERR_DETAIL_LIMIT = 200
+
+
+def stderr_detail(stderr: bytes) -> str:
+    """Render the last non-blank line of stderr as a ``': ...'`` message suffix.
+
+    Returns the empty string when there is nothing to report, so the suffix can
+    be interpolated unconditionally. A command that gives up states the reason
+    on its final line, and that line is what has to survive into a Juju status
+    message; it is truncated, because a status message is not a log. Output
+    that is not valid UTF-8 is decoded with replacements rather than refused.
+    """
+    lines = [line.strip() for line in stderr.decode('utf-8', errors='replace').splitlines() if line.strip()]
+    return f': {lines[-1][:_STDERR_DETAIL_LIMIT]}' if lines else ''
+
+
 def run(
     cmd: collections.abc.Sequence[str],
     *,
