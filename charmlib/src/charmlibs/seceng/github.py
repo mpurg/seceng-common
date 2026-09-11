@@ -116,13 +116,16 @@ class GitHubClient:
         asset_name: str,
         *,
         expected_sha256: str | None = None,
-        dir: pathlib.Path | None = None,
     ) -> collections.abc.Iterator[pathlib.Path]:
         """Download a named asset of a release tag to a temporary path.
 
         Yields the path of the complete artifact and deletes it when the with
-        block exits: a path that escapes the block names nothing. Pass dir to
-        place the artifact on the same filesystem as its eventual destination.
+        block exits: a path that escapes the block names nothing.
+
+        The artifact is created under tempfile.gettempdir(). Because the
+        artifact is yielded as a path rather than an open file descriptor,
+        the directory must not be writable outside the trust boundary to
+        prevent payload substitution after digest verification.
 
         When expected_sha256 is given the digest is computed as the bytes
         arrive and verified before the path is yielded, so an unverified
@@ -144,7 +147,7 @@ class GitHubClient:
 
         # Closing unlinks, and the with covers every exit including one thrown
         # in at the yield, so no failure path can leave the artifact behind.
-        with tempfile.NamedTemporaryFile(mode='wb', delete=True, dir=dir) as artifact:
+        with tempfile.NamedTemporaryFile(mode='wb', delete=True) as artifact:
             digest = self._stream(asset_url, artifact, subject)
             # Compared as bytes: an expected digest that is not ASCII hex is
             # then a mismatch like any other, where comparing as str would

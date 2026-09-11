@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import pathlib
+import tempfile
 import typing
 import urllib.error
 import urllib.request
@@ -109,15 +110,21 @@ def _fetch(
     asset_name: str = _ASSET,
     *,
     expected_sha256: str | None = None,
-    dir: pathlib.Path | None = None,
 ) -> None:
     """Run a fetch to completion and discard the artifact.
 
     Nothing is retrieved until the context is entered, so a test that expects a
     failure has to enter the context to provoke it.
     """
-    with GitHubClient(_TOKEN).fetch_release_asset(repo, tag, asset_name, expected_sha256=expected_sha256, dir=dir):
+    with GitHubClient(_TOKEN).fetch_release_asset(repo, tag, asset_name, expected_sha256=expected_sha256):
         pass
+
+
+@pytest.fixture
+def temp_root(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> pathlib.Path:
+    """Redirect the platform temporary directory to a test-isolated path."""
+    monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
+    return tmp_path
 
 
 # ============================================================================
@@ -237,15 +244,15 @@ def test_fetch_release_asset_rejects_path_traversal_segments(
 
 
 def test_fetch_release_asset_retrieves_nothing_until_the_context_is_entered(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, temp_root: pathlib.Path
 ) -> None:
     """Forgetting the with cannot strand an artifact, because it downloads nothing."""
     recorded = _fake_github(monkeypatch)
 
-    unentered = GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, dir=tmp_path)
+    unentered = GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
 
     assert recorded == []
-    assert list(tmp_path.iterdir()) == []
+    assert list(temp_root.iterdir()) == []
 
     with unentered as artifact:
         assert artifact.read_bytes() == _PAYLOAD
@@ -267,15 +274,16 @@ def test_fetch_release_asset_yields_a_readable_path_and_deletes_it_on_exit(
     assert not escaped.exists()
 
 
-def test_fetch_release_asset_honours_the_requested_directory(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+def test_fetch_release_asset_places_the_artifact_in_the_platform_temporary_directory(
+    monkeypatch: pytest.MonkeyPatch, temp_root: pathlib.Path
 ) -> None:
+    """Placement follows gettempdir(), so TMPDIR picks the filesystem."""
     _fake_github(monkeypatch)
 
-    with GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, dir=tmp_path) as artifact:
-        assert artifact.parent == tmp_path
+    with GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET) as artifact:
+        assert artifact.parent == temp_root
 
-    assert list(tmp_path.iterdir()) == []
+    assert list(temp_root.iterdir()) == []
 
 
 def test_fetch_release_asset_streams_a_payload_larger_than_one_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -303,28 +311,28 @@ def test_fetch_release_asset_accepts_a_matching_digest(monkeypatch: pytest.Monke
 
 
 def test_fetch_release_asset_discards_a_payload_with_the_wrong_digest(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, temp_root: pathlib.Path
 ) -> None:
     _fake_github(monkeypatch)
 
     with pytest.raises(GitHubChecksumError, match='sha256 mismatch'):
-        _fetch(expected_sha256='e' * 64, dir=tmp_path)
+        _fetch(expected_sha256='e' * 64)
 
     # No unverified payload is left behind for a caller to pick up.
-    assert list(tmp_path.iterdir()) == []
+    assert list(temp_root.iterdir()) == []
 
 
 @pytest.mark.parametrize('malformed', ['', '   ', 'abc', _PAYLOAD_SHA256[:-1], _PAYLOAD_SHA256 + 'a', 'SHA256\ufffd'])
 def test_fetch_release_asset_treats_a_malformed_expected_digest_as_a_mismatch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, malformed: str
+    monkeypatch: pytest.MonkeyPatch, temp_root: pathlib.Path, malformed: str
 ) -> None:
     """A truncated, mistyped, or undecodable digest fails closed, never with a TypeError."""
     _fake_github(monkeypatch)
 
     with pytest.raises(GitHubChecksumError, match='sha256 mismatch'):
-        _fetch(expected_sha256=malformed, dir=tmp_path)
+        _fetch(expected_sha256=malformed)
 
-    assert list(tmp_path.iterdir()) == []
+    assert list(temp_root.iterdir()) == []
 
 
 # ============================================================================
@@ -393,14 +401,14 @@ def test_fetch_release_asset_reports_an_asset_without_an_api_url(monkeypatch: py
 
 
 def test_fetch_release_asset_cleans_up_when_the_download_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, temp_root: pathlib.Path
 ) -> None:
     _fake_github(monkeypatch, download=_http_error(404))
 
     with pytest.raises(GitHubNotFoundError, match='github returned 404'):
-        _fetch(dir=tmp_path)
+        _fetch()
 
-    assert list(tmp_path.iterdir()) == []
+    assert list(temp_root.iterdir()) == []
 
 
 def test_fetch_release_asset_never_leaks_a_presigned_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,20 +424,20 @@ def test_fetch_release_asset_never_leaks_a_presigned_url(monkeypatch: pytest.Mon
 
 
 def test_fetch_release_asset_aborts_a_download_that_outruns_its_deadline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, temp_root: pathlib.Path
 ) -> None:
     _fake_github(monkeypatch, download=b'x' * (128 * 1024))
     clock = iter([0.0, 1.0, 10_000.0])
     monkeypatch.setattr('charmlibs.seceng.github.time.monotonic', lambda: next(clock))
 
     with pytest.raises(GitHubNetworkError, match='exceeded 300 seconds'):
-        _fetch(dir=tmp_path)
+        _fetch()
 
-    assert list(tmp_path.iterdir()) == []
+    assert list(temp_root.iterdir()) == []
 
 
 def test_fetch_release_asset_translates_a_read_failure_mid_stream(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, temp_root: pathlib.Path
 ) -> None:
     def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> typing.IO[bytes]:
         if '/releases/tags/' in request.full_url:
@@ -439,6 +447,6 @@ def test_fetch_release_asset_translates_a_read_failure_mid_stream(
     monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
 
     with pytest.raises(GitHubNetworkError, match='network error while fetching'):
-        _fetch(dir=tmp_path)
+        _fetch()
 
-    assert list(tmp_path.iterdir()) == []
+    assert list(temp_root.iterdir()) == []
