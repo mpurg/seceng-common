@@ -108,6 +108,7 @@ class GitHubClient:
         """Bind to the credential token, or raise ValueError if it cannot be a header value."""
         self._token = Token(token)
 
+    @contextlib.contextmanager
     def fetch_release_asset(
         self,
         repo: str,
@@ -116,22 +117,23 @@ class GitHubClient:
         *,
         expected_sha256: str | None = None,
         dir: pathlib.Path | None = None,
-    ) -> typing.IO[bytes]:
-        """Download a named asset of a release tag into a temporary file.
+    ) -> collections.abc.Iterator[pathlib.Path]:
+        """Download a named asset of a release tag to a temporary path.
 
-        Returns the open temporary file positioned at offset 0. Closing it
-        deletes it, so the caller owns the artifact's lifetime; the file is
-        closed for you on any failure. Pass dir to place it on the same
-        filesystem as its eventual destination.
+        Yields the path of the complete artifact and deletes it when the with
+        block exits: a path that escapes the block names nothing. Pass dir to
+        place the artifact on the same filesystem as its eventual destination.
 
         When expected_sha256 is given the digest is computed as the bytes
-        arrive and verified before the handle is returned, so an unverified
-        payload is never reachable by name. Whitespace and case are ignored;
-        anything else that is not the artifact's digest is a mismatch.
+        arrive and verified before the path is yielded, so an unverified
+        payload is never reachable under a name the caller knows. Whitespace
+        and case are ignored; anything else that is not the artifact's digest
+        is a mismatch.
 
-        Raises ValueError for a malformed repo, tag, or asset name, and
-        GitHubAuthError, GitHubNotFoundError, GitHubNetworkError,
-        GitHubChecksumError, or GitHubError for a failed retrieval.
+        Nothing is retrieved until the context is entered. Raises ValueError
+        for a malformed repo, tag, or asset name, and GitHubAuthError,
+        GitHubNotFoundError, GitHubNetworkError, GitHubChecksumError, or
+        GitHubError for a failed retrieval.
         """
         expected = None
         if expected_sha256 is not None:
@@ -140,20 +142,19 @@ class GitHubClient:
         asset_url = self._locate_asset(repo, tag, asset_name)
         subject = f'asset {asset_name!r} of {repo}@{tag}'
 
-        artifact = tempfile.NamedTemporaryFile(mode='w+b', delete=True, dir=dir)
-        try:
+        # Closing unlinks, and the with covers every exit including one thrown
+        # in at the yield, so no failure path can leave the artifact behind.
+        with tempfile.NamedTemporaryFile(mode='wb', delete=True, dir=dir) as artifact:
             digest = self._stream(asset_url, artifact, subject)
             # Compared as bytes: an expected digest that is not ASCII hex is
             # then a mismatch like any other, where comparing as str would
             # raise TypeError on a non-ASCII character.
             if expected is not None and not hmac.compare_digest(digest.encode(), expected.encode()):
                 raise GitHubChecksumError(f'sha256 mismatch for {subject}: expected {expected}, computed {digest}')
+            # The caller reads the artifact by name, so buffered bytes must
+            # reach the file before the path is of any use.
             artifact.flush()
-            artifact.seek(0)
-        except BaseException:
-            artifact.close()
-            raise
-        return artifact
+            yield pathlib.Path(artifact.name)
 
     def _locate_asset(self, repo: str, tag: str, asset_name: str) -> str:
         """Return the API URL of a named asset on a release tag.

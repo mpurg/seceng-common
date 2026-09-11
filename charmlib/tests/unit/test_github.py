@@ -103,6 +103,23 @@ def _http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError(_ASSET_URL, code, 'boom', hdrs=None, fp=None)  # type: ignore[arg-type]
 
 
+def _fetch(
+    repo: str = _REPO,
+    tag: str = _TAG,
+    asset_name: str = _ASSET,
+    *,
+    expected_sha256: str | None = None,
+    dir: pathlib.Path | None = None,
+) -> None:
+    """Run a fetch to completion and discard the artifact.
+
+    Nothing is retrieved until the context is entered, so a test that expects a
+    failure has to enter the context to provoke it.
+    """
+    with GitHubClient(_TOKEN).fetch_release_asset(repo, tag, asset_name, expected_sha256=expected_sha256, dir=dir):
+        pass
+
+
 # ============================================================================
 # Token
 # ============================================================================
@@ -156,8 +173,7 @@ def test_client_rejects_an_invalid_token_at_construction() -> None:
 def test_fetch_release_asset_keeps_the_credential_off_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
     recorded = _fake_github(monkeypatch)
 
-    with GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET):
-        pass
+    _fetch()
 
     assert len(recorded) == 2
     for request in recorded:
@@ -170,8 +186,7 @@ def test_fetch_release_asset_keeps_the_credential_off_redirects(monkeypatch: pyt
 def test_fetch_release_asset_sends_the_expected_api_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     recorded = _fake_github(monkeypatch)
 
-    with GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET):
-        pass
+    _fetch()
 
     lookup, download = recorded
     # urllib capitalises header names as it stores them.
@@ -186,8 +201,7 @@ def test_fetch_release_asset_sends_the_expected_api_headers(monkeypatch: pytest.
 def test_fetch_release_asset_percent_encodes_url_segments(monkeypatch: pytest.MonkeyPatch) -> None:
     recorded = _fake_github(monkeypatch)
 
-    with GitHubClient(_TOKEN).fetch_release_asset('org name/repo?x', 'v1.0/rc 1#f', _ASSET):
-        pass
+    _fetch('org name/repo?x', 'v1.0/rc 1#f')
 
     expected = 'https://api.github.com/repos/org%20name/repo%3Fx/releases/tags/v1.0%2Frc%201%23f'
     assert recorded[0].full_url == expected
@@ -212,7 +226,7 @@ def test_fetch_release_asset_rejects_path_traversal_segments(
     recorded = _fake_github(monkeypatch)
 
     with pytest.raises(ValueError, match=message):
-        GitHubClient(_TOKEN).fetch_release_asset(repo, tag, _ASSET)
+        _fetch(repo, tag)
 
     assert recorded == []
 
@@ -222,19 +236,35 @@ def test_fetch_release_asset_rejects_path_traversal_segments(
 # ============================================================================
 
 
-def test_fetch_release_asset_returns_a_rewound_temporary_file(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_release_asset_retrieves_nothing_until_the_context_is_entered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Forgetting the with cannot strand an artifact, because it downloads nothing."""
+    recorded = _fake_github(monkeypatch)
+
+    unentered = GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, dir=tmp_path)
+
+    assert recorded == []
+    assert list(tmp_path.iterdir()) == []
+
+    with unentered as artifact:
+        assert artifact.read_bytes() == _PAYLOAD
+    assert len(recorded) == 2
+
+
+def test_fetch_release_asset_yields_a_readable_path_and_deletes_it_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _fake_github(monkeypatch)
 
-    artifact = GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
-    try:
-        assert artifact.read() == _PAYLOAD
-        path = pathlib.Path(artifact.name)
-        assert path.is_file()
-    finally:
-        artifact.close()
+    with GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET) as artifact:
+        # Read by name, as a consumer taking a path does: the whole payload has
+        # to be on disk, not sitting in the writer's buffer.
+        assert artifact.read_bytes() == _PAYLOAD
+        escaped = artifact
 
-    # delete=True: closing the handle is what removes the artifact.
-    assert not path.exists()
+    # A path that outlives the block names nothing, so misuse fails loudly.
+    assert not escaped.exists()
 
 
 def test_fetch_release_asset_honours_the_requested_directory(
@@ -243,7 +273,7 @@ def test_fetch_release_asset_honours_the_requested_directory(
     _fake_github(monkeypatch)
 
     with GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, dir=tmp_path) as artifact:
-        assert pathlib.Path(artifact.name).parent == tmp_path
+        assert artifact.parent == tmp_path
 
     assert list(tmp_path.iterdir()) == []
 
@@ -255,7 +285,7 @@ def test_fetch_release_asset_streams_a_payload_larger_than_one_chunk(monkeypatch
     with GitHubClient(_TOKEN).fetch_release_asset(
         _REPO, _TAG, _ASSET, expected_sha256=hashlib.sha256(payload).hexdigest()
     ) as artifact:
-        assert artifact.read() == payload
+        assert artifact.read_bytes() == payload
 
 
 # ============================================================================
@@ -269,7 +299,7 @@ def test_fetch_release_asset_accepts_a_matching_digest(monkeypatch: pytest.Monke
     with GitHubClient(_TOKEN).fetch_release_asset(
         _REPO, _TAG, _ASSET, expected_sha256=f'  {_PAYLOAD_SHA256.upper()}\n'
     ) as artifact:
-        assert artifact.read() == _PAYLOAD
+        assert artifact.read_bytes() == _PAYLOAD
 
 
 def test_fetch_release_asset_discards_a_payload_with_the_wrong_digest(
@@ -278,7 +308,7 @@ def test_fetch_release_asset_discards_a_payload_with_the_wrong_digest(
     _fake_github(monkeypatch)
 
     with pytest.raises(GitHubChecksumError, match='sha256 mismatch'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, expected_sha256='e' * 64, dir=tmp_path)
+        _fetch(expected_sha256='e' * 64, dir=tmp_path)
 
     # No unverified payload is left behind for a caller to pick up.
     assert list(tmp_path.iterdir()) == []
@@ -292,7 +322,7 @@ def test_fetch_release_asset_treats_a_malformed_expected_digest_as_a_mismatch(
     _fake_github(monkeypatch)
 
     with pytest.raises(GitHubChecksumError, match='sha256 mismatch'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, expected_sha256=malformed, dir=tmp_path)
+        _fetch(expected_sha256=malformed, dir=tmp_path)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -306,7 +336,7 @@ def test_fetch_release_asset_reports_a_rejected_token(monkeypatch: pytest.Monkey
     _fake_github(monkeypatch, lookup=_http_error(401))
 
     with pytest.raises(GitHubAuthError, match='github rejected the token') as raised:
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
     assert _TOKEN not in str(raised.value)
 
@@ -315,14 +345,14 @@ def test_fetch_release_asset_reports_a_missing_release(monkeypatch: pytest.Monke
     _fake_github(monkeypatch, lookup=_http_error(404))
 
     with pytest.raises(GitHubNotFoundError, match="github returned 404 for release '1.2.3'"):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
 
 def test_fetch_release_asset_reports_an_unexpected_status(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_github(monkeypatch, lookup=_http_error(500))
 
     with pytest.raises(GitHubError, match='github returned http 500') as raised:
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
     assert not isinstance(raised.value, GitHubNotFoundError | GitHubAuthError)
 
@@ -331,35 +361,35 @@ def test_fetch_release_asset_reports_a_network_failure(monkeypatch: pytest.Monke
     _fake_github(monkeypatch, lookup=OSError('connection reset'))
 
     with pytest.raises(GitHubNetworkError, match='network error while fetching'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
 
 def test_fetch_release_asset_reports_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_github(monkeypatch, lookup=b'<html>not json</html>')
 
     with pytest.raises(GitHubError, match='github returned invalid json'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
 
 def test_fetch_release_asset_reports_a_payload_without_assets(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_github(monkeypatch, lookup=json.dumps({'tag_name': _TAG}).encode('utf-8'))
 
     with pytest.raises(GitHubError, match='github returned no assets list'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
 
 def test_fetch_release_asset_reports_an_asset_missing_from_the_release(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_github(monkeypatch, lookup=_release_json(asset_name='something-else.tar.gz'))
 
     with pytest.raises(GitHubNotFoundError, match="has no asset named 'wheelhouse.tar.gz'"):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
 
 def test_fetch_release_asset_reports_an_asset_without_an_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_github(monkeypatch, lookup=json.dumps({'assets': [{'name': _ASSET}]}).encode('utf-8'))
 
     with pytest.raises(GitHubError, match='has no api url'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
 
 def test_fetch_release_asset_cleans_up_when_the_download_fails(
@@ -368,7 +398,7 @@ def test_fetch_release_asset_cleans_up_when_the_download_fails(
     _fake_github(monkeypatch, download=_http_error(404))
 
     with pytest.raises(GitHubNotFoundError, match='github returned 404'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, dir=tmp_path)
+        _fetch(dir=tmp_path)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -379,7 +409,7 @@ def test_fetch_release_asset_never_leaks_a_presigned_url(monkeypatch: pytest.Mon
     _fake_github(monkeypatch, lookup=_release_json(asset_url=presigned), download=OSError('reset'))
 
     with pytest.raises(GitHubNetworkError) as raised:
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET)
+        _fetch()
 
     assert 'X-Amz-Signature' not in str(raised.value)
     assert str(raised.value) == f"network error while fetching asset '{_ASSET}' of {_REPO}@{_TAG}"
@@ -393,7 +423,7 @@ def test_fetch_release_asset_aborts_a_download_that_outruns_its_deadline(
     monkeypatch.setattr('charmlibs.seceng.github.time.monotonic', lambda: next(clock))
 
     with pytest.raises(GitHubNetworkError, match='exceeded 300 seconds'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, dir=tmp_path)
+        _fetch(dir=tmp_path)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -409,6 +439,6 @@ def test_fetch_release_asset_translates_a_read_failure_mid_stream(
     monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
 
     with pytest.raises(GitHubNetworkError, match='network error while fetching'):
-        GitHubClient(_TOKEN).fetch_release_asset(_REPO, _TAG, _ASSET, dir=tmp_path)
+        _fetch(dir=tmp_path)
 
     assert list(tmp_path.iterdir()) == []
